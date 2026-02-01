@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS l7_events (
   stats_ingest_latency_ms FLOAT8,
 
   -- Metadata as JSONB for extensibility
-  metadata JSONB,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
 
   -- System timestamps
   created_at TIMESTAMP DEFAULT now(),
@@ -115,10 +115,30 @@ CREATE INDEX IF NOT EXISTS idx_l7_tls_sni ON l7_events(tls_sni);
 -- Batch tracking
 CREATE INDEX IF NOT EXISTS idx_l7_batch_id ON l7_events(batch_id);
 
+-- JSONB metadata index (supports flexible schema growth)
+CREATE INDEX IF NOT EXISTS idx_l7_metadata ON l7_events USING gin (metadata);
+
 -- Composite indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_l7_ndpi_time ON l7_events(ndpi_protocol, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_l7_cert_time ON l7_events(cert_leaf_sha256, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_l7_flow_time ON l7_events(flow_key, observed_at DESC);
+
+-- Convert table into a TimescaleDB hypertable for time-series performance when the extension is available
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb') THEN
+        CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+        PERFORM create_hypertable(
+            'l7_events',
+            'observed_at',
+            if_not_exists => TRUE,
+            chunk_time_interval => interval '1 day'
+        );
+    ELSE
+        RAISE NOTICE 'TimescaleDB extension not installed; hypertable creation skipped.';
+    END IF;
+END;
+$$;
 `
 
 // RunMigrations creates all required tables and indexes.

@@ -176,7 +176,7 @@ ndpi_protocol TEXT, ndpi_category TEXT, ndpi_application TEXT, ndpi_confidence F
 stats_bytes BIGINT, stats_packets INT, stats_duration_ms FLOAT8
 
 -- Extensibility
-metadata JSONB
+metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 ```
 
 **Key Indexes:**
@@ -187,6 +187,37 @@ CREATE INDEX idx_l7_ndpi_category ON l7_events(ndpi_category);
 CREATE INDEX idx_l7_cert_leaf_sha256 ON l7_events(cert_leaf_sha256);
 CREATE INDEX idx_l7_src_dst_ip ON l7_events(src_ip, dst_ip);
 CREATE INDEX idx_l7_observed_at ON l7_events(observed_at DESC);
+```
+
+### Timescale hypertable & JSONB metadata
+
+The migrations automatically wrap `l7_events` in a TimescaleDB hypertable when the `timescaledb` extension is installed. The database schema stays backwards-compatible with plain PostgreSQL—if the extension is missing, the setup logs a notice and leaves the table as-is.
+
+Data is chunked on the `observed_at` timestamp (1 day intervals by default) to make time-range aggregation queries fast. A GIN index on `metadata JSONB NOT NULL DEFAULT '{}'` makes the schema extensible while keeping JSONB filters efficient for future certificates, verdicts, or NDPI enrichments.
+
+#### Hypertable query example
+
+```sql
+SELECT
+  time_bucket('5 minutes', observed_at) AS bucket,
+  ndpi_category,
+  sum(stats_bytes) AS bytes
+FROM l7_events
+WHERE observed_at >= now() - interval '6 hours'
+GROUP BY bucket, ndpi_category
+ORDER BY bucket DESC;
+```
+
+#### JSONB metadata query example
+
+```sql
+SELECT
+  metadata->'ndpi'->>'application' AS application,
+  count(*) AS flows
+FROM l7_events
+WHERE metadata @> '{"verdict": {"action": "drop"}}'
+GROUP BY application
+ORDER BY flows DESC;
 ```
 
 ### Querying NDPI Fields

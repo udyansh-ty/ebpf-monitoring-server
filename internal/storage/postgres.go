@@ -77,9 +77,16 @@ func (s *PostgreSQLStorage) Store(ctx context.Context, event core.Event) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Marshal event metadata to JSON
+	// Marshal event metadata to JSONB
 	metadata := event.Metadata()
-	metadataJSON, _ := json.Marshal(metadata)
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		logger.Errorf("Failed to serialize metadata: %v", err)
+		return fmt.Errorf("failed to marshal event metadata: %w", err)
+	}
 
 	// Extract NDPI fields if present
 	ndpiProtocol := ""
@@ -277,7 +284,7 @@ func (s *PostgreSQLStorage) Store(ctx context.Context, event core.Event) error {
 		verdictAction, verdictRuleID, verdictPriority,
 		ndpiProtocol, ndpiCategory, ndpiApplication, ndpiConfidence, ndpiID,
 		statsBytesVal, statsPacketsVal, statsDurationVal,
-		string(metadataJSON),
+		metadataJSON,
 	)
 
 	if err != nil {
