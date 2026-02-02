@@ -1,8 +1,6 @@
 module github.com/srodi/ebpf-server
 
-go 1.23.0
-
-toolchain go1.23.3
+go 1.23
 
 require (
 	github.com/cilium/ebpf v0.19.0

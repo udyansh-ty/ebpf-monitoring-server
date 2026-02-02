@@ -204,6 +204,17 @@ func (a *Aggregator) IsRunning() bool {
 	return a.running
 }
 
+// GetStorage returns the aggregator's event storage interface.
+// ANCHOR: Storage Access - L7 Webhook Integration - Jan 31, 2026
+// WHY: Allow L7 receiver to store webhook events in aggregator storage
+// WHAT: Export internal storage interface for external packages
+// HOW: Return core.EventSink interface with proper synchronization
+func (a *Aggregator) GetStorage() core.EventSink {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.storage
+}
+
 // HandleEvents handles HTTP requests for querying aggregated events.
 //
 //	@Summary		Query aggregated events

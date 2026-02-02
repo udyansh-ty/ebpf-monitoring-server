@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/srodi/ebpf-server/internal/aggregator"
+	"github.com/srodi/ebpf-server/internal/l7"
 	"github.com/srodi/ebpf-server/pkg/logger"
 
 	_ "github.com/srodi/ebpf-server/docs/swagger-aggregator" // Import generated aggregator docs
@@ -59,6 +60,18 @@ func main() {
 	mux.HandleFunc("/api/list-packet-drops", agg.HandleListPacketDrops)
 	mux.HandleFunc("/api/connection-summary", agg.HandleConnectionSummary)
 	mux.HandleFunc("/api/packet-drop-summary", agg.HandlePacketDropSummary)
+
+	// ANCHOR: L7 Webhook Endpoints - Vaanvil Integration - Jan 31, 2026
+	// WHY: Accept L7 security telemetry from external sensors
+	// WHAT: Register HTTP endpoints for webhook ingestion and monitoring
+	// HOW: Create L7 receiver with aggregator storage, register handlers
+	l7Receiver := l7.NewReceiver(agg.GetStorage(), &l7.ReceiverConfig{
+		MaxPayloadSize:  10 * 1024 * 1024, // 10MB payload limit
+		RequestTimeout:  30 * time.Second,
+		ValidateBatchID: true,
+	})
+	mux.HandleFunc("/api/l7/webhook", l7Receiver.HandleWebhook)
+	mux.HandleFunc("/api/l7/webhook/stats", l7Receiver.HandleWebhookStats)
 
 	// Swagger documentation
 	mux.HandleFunc("/swagger/", httpSwagger.WrapHandler)
