@@ -11,6 +11,7 @@ import (
 
 	"github.com/srodi/ebpf-server/internal/aggregator"
 	"github.com/srodi/ebpf-server/internal/l7"
+	"github.com/srodi/ebpf-server/internal/storage"
 	"github.com/srodi/ebpf-server/pkg/logger"
 
 	_ "github.com/srodi/ebpf-server/docs/swagger-aggregator" // Import generated aggregator docs
@@ -21,10 +22,32 @@ func main() {
 	// Parse command-line flags
 	var (
 		httpAddr = flag.String("addr", ":8081", "HTTP server address")
+		dbURL    = flag.String("db-url", os.Getenv("DB_URL"), "PostgreSQL connection string (optional)")
 	)
 	flag.Parse()
 
 	logger.Info("Starting eBPF Event Aggregator...")
+
+	// ANCHOR: Optional PostgreSQL Storage for L7 Events - Jan 31, 2026
+	// WHY: Enable persistent storage of L7 webhook events with NDPI enrichment
+	// WHAT: Check for DB_URL env var or -db-url flag, configure storage backend
+	// HOW: Create PostgreSQLStorage if URL provided, otherwise use MemoryStorage
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var pgStorage *storage.PostgreSQLStorage
+	if *dbURL != "" {
+		logger.Infof("Initializing PostgreSQL storage: %s", *dbURL)
+		var err error
+		pgStorage, err = storage.NewPostgreSQLStorage(ctx, *dbURL)
+		if err != nil {
+			logger.Fatalf("Failed to initialize PostgreSQL storage: %v", err)
+		}
+		defer pgStorage.Close()
+		logger.Info("✅ PostgreSQL storage initialized successfully")
+	} else {
+		logger.Info("Using in-memory storage (set DB_URL environment variable to enable PostgreSQL)")
+	}
 
 	// Create aggregator
 	agg, err := aggregator.New(&aggregator.Config{
@@ -33,10 +56,6 @@ func main() {
 	if err != nil {
 		logger.Fatalf("Failed to create aggregator: %v", err)
 	}
-
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Start aggregator
 	if err := agg.Start(ctx); err != nil {

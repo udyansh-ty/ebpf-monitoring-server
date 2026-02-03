@@ -241,6 +241,9 @@ func NewL7Event(payload *WebhookPayload, webhookEvent *WebhookEvent) (*L7Event, 
 		metadata["legacy_metadata"] = webhookEvent.Metadata
 	}
 
+	// Enrich with NDPI classification data
+	enrichNDPI(metadata, webhookEvent)
+
 	event := &L7Event{
 		id:        eventID,
 		eventType: "l7_" + webhookEvent.EventType,
@@ -304,4 +307,40 @@ func (e *L7Event) MarshalJSON() ([]byte, error) {
 		m[k] = v
 	}
 	return json.Marshal(m)
+}
+
+func enrichNDPI(metadata map[string]interface{}, webhookEvent *WebhookEvent) {
+	if metadata == nil || webhookEvent == nil {
+		return
+	}
+
+	flow := ndpiFlow{
+		SrcIP:    normalizeIP(webhookEvent.SrcIP),
+		DstIP:    normalizeIP(webhookEvent.DstIP),
+		SrcPort:  webhookEvent.SrcPort,
+		DstPort:  webhookEvent.DstPort,
+		Protocol: webhookEvent.Protocol,
+	}
+
+	if webhookEvent.TLS != nil {
+		flow.SNI = webhookEvent.TLS.SNI
+		flow.ALPN = webhookEvent.TLS.ALPN
+	}
+	if webhookEvent.Fingerprints != nil {
+		flow.JA3 = webhookEvent.Fingerprints.JA3
+		flow.JA4 = webhookEvent.Fingerprints.JA4
+	}
+
+	info := classifyFlow(flow)
+	if info.ProtocolName == "" && info.Category == "" && info.Application == "" {
+		return
+	}
+
+	metadata["ndpi"] = map[string]interface{}{
+		"protocol":    info.ProtocolName,
+		"category":    info.Category,
+		"application": info.Application,
+		"confidence":  info.Confidence,
+		"ndpi_id":     info.NDPIProtocolID,
+	}
 }
