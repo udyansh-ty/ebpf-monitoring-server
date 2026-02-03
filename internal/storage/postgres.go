@@ -20,14 +20,23 @@ import (
 // HOW: Use pgx connection pool for efficient DB access, marshal events to structured columns + JSONB
 
 // PostgreSQLStorage implements EventSink using PostgreSQL.
-// It stores L7 events with full NDPI enrichment data for persistent storage and querying.
+// It stores L7 and eBPF events with proper routing based on event type.
+// For L7 events (webhook receivers): routes to l7_events table with NDPI enrichment
+// For eBPF events (kernel monitoring): routes to ebpf_events table with multi-NIC support
 type PostgreSQLStorage struct {
-	pool *pgxpool.Pool
-	mu   sync.RWMutex
+	pool        *pgxpool.Pool
+	l7Storage   *PostgreSQLL7Storage
+	ebpfStorage *EBPFEventStorage
+	ebpfQueries *EBPFQueries
+	mu          sync.RWMutex
 }
 
 // NewPostgreSQLStorage creates a new PostgreSQL-backed event storage.
 // connStr should be a PostgreSQL connection string (e.g., "postgres://user:pass@localhost/dbname").
+// ANCHOR: Event Storage Initialization - Feb 3, 2026
+// WHY: Initialize both L7 and eBPF event storage backends with proper routing
+// WHAT: Create PostgreSQLStorage with separate L7 and eBPF storage instances
+// HOW: Set up connection pool, run migrations, and initialize both storage backends
 func NewPostgreSQLStorage(ctx context.Context, connStr string) (*PostgreSQLStorage, error) {
 	// Create connection pool
 	config, err := pgxpool.ParseConfig(connStr)
@@ -68,15 +77,47 @@ func NewPostgreSQLStorage(ctx context.Context, connStr string) (*PostgreSQLStora
 	logger.Infof("✅ PostgreSQL storage initialized with connection pool (max_conns=20, min_conns=5)")
 
 	return &PostgreSQLStorage{
-		pool: pool,
+		pool:        pool,
+		l7Storage:   &PostgreSQLL7Storage{pool: pool},
+		ebpfStorage: NewEBPFEventStorage(pool),
+		ebpfQueries: NewEBPFQueries(pool),
 	}, nil
 }
 
-// Store saves an event to PostgreSQL.
+// PostgreSQLL7Storage handles storage of L7 webhook events to PostgreSQL.
+// This type encapsulates the L7-specific storage logic that was previously in PostgreSQLStorage.
+type PostgreSQLL7Storage struct {
+	pool *pgxpool.Pool
+}
+
+// Store saves an event to PostgreSQL by routing to appropriate backend.
+// ANCHOR: Event Routing by Type - Feb 3, 2026
+// WHY: Route events to correct storage table based on event type
+// WHAT: Determine event type and delegate to L7 or eBPF storage
+// HOW: Check event type field; route eBPF events (connection, packet_drop) to eBPF storage, others to L7
 func (s *PostgreSQLStorage) Store(ctx context.Context, event core.Event) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	// Route event to appropriate storage backend based on type
+	eventType := event.Type()
+
+	// ANCHOR: eBPF Event Routing - Feb 3, 2026
+	// WHY: Separate storage for kernel-level events to enable multi-NIC support and proper indexing
+	// WHAT: Route connection, packet_drop, and other kernel events to eBPF storage
+	// HOW: Check event type and delegate to EBPFEventStorage.Store()
+	if eventType == "connection" || eventType == "packet_drop" || eventType == "file_operation" || eventType == "process_exec" {
+		// Route to eBPF event storage (supports multi-NIC and multi-program)
+		return s.ebpfStorage.Store(ctx, event)
+	}
+
+	// Default to L7 storage for webhook events
+	return s.storeL7Event(ctx, event)
+}
+
+// storeL7Event stores an L7 webhook event to PostgreSQL.
+// This method contains the original L7-specific storage logic.
+func (s *PostgreSQLStorage) storeL7Event(ctx context.Context, event core.Event) error {
 	// Marshal event metadata to JSONB
 	metadata := event.Metadata()
 	if metadata == nil {
@@ -298,10 +339,25 @@ func (s *PostgreSQLStorage) Store(ctx context.Context, event core.Event) error {
 }
 
 // Query retrieves events matching the criteria from PostgreSQL.
+// ANCHOR: Query Routing by Event Type - Feb 3, 2026
+// WHY: Route queries to correct table based on event type for optimal performance
+// WHAT: Determine query table from event type and delegate to appropriate backend
+// HOW: If event type is eBPF type, use eBPFEventStorage; otherwise use L7 storage
 func (s *PostgreSQLStorage) Query(ctx context.Context, query core.Query) ([]core.Event, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	// Route to appropriate backend
+	if query.EventType == "connection" || query.EventType == "packet_drop" || query.EventType == "file_operation" || query.EventType == "process_exec" {
+		return s.ebpfStorage.Query(ctx, query)
+	}
+
+	// Default to L7 storage
+	return s.queryL7Events(ctx, query)
+}
+
+// queryL7Events queries events from the L7 events table.
+func (s *PostgreSQLStorage) queryL7Events(ctx context.Context, query core.Query) ([]core.Event, error) {
 	// Build WHERE clause
 	var args []interface{}
 	whereClause := "WHERE 1=1"
@@ -337,10 +393,6 @@ func (s *PostgreSQLStorage) Query(ctx context.Context, query core.Query) ([]core
 		args = append(args, query.Until)
 		argIndex++
 	}
-
-	// Note: Core Query interface doesn't support NDPI/certificate filters.
-	// For advanced filtering, create a new QueryAdvanced method or use direct SQL.
-	// This implementation focuses on the standard core.Query fields only.
 
 	// Build ORDER BY and LIMIT
 	orderBy := "ORDER BY observed_at DESC"
@@ -382,7 +434,6 @@ func (s *PostgreSQLStorage) Query(ctx context.Context, query core.Query) ([]core
 		}
 
 		// Reconstruct event from stored data
-		// Note: This is a simplified reconstruction - full details are in metadata
 		event := &postgresEvent{
 			id:       id,
 			typ:      eventType,
@@ -406,10 +457,25 @@ func (s *PostgreSQLStorage) Query(ctx context.Context, query core.Query) ([]core
 }
 
 // Count returns the number of events matching the criteria.
+// ANCHOR: Count Routing by Event Type - Feb 3, 2026
+// WHY: Route count queries to correct table for proper enumeration
+// WHAT: Route count to eBPF or L7 storage based on event type
+// HOW: Delegate to appropriate backend Count method
 func (s *PostgreSQLStorage) Count(ctx context.Context, query core.Query) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	// Route to appropriate backend
+	if query.EventType == "connection" || query.EventType == "packet_drop" || query.EventType == "file_operation" || query.EventType == "process_exec" {
+		return s.ebpfStorage.Count(ctx, query)
+	}
+
+	// Default to L7 storage
+	return s.countL7Events(ctx, query)
+}
+
+// countL7Events counts events in the L7 events table.
+func (s *PostgreSQLStorage) countL7Events(ctx context.Context, query core.Query) (int, error) {
 	// Build WHERE clause
 	var args []interface{}
 	whereClause := "WHERE 1=1"

@@ -28,23 +28,28 @@ func main() {
 
 	logger.Info("Starting eBPF Event Aggregator...")
 
-	// ANCHOR: Optional PostgreSQL Storage for L7 Events - Jan 31, 2026
-	// WHY: Enable persistent storage of L7 webhook events with NDPI enrichment
-	// WHAT: Check for DB_URL env var or -db-url flag, configure storage backend
-	// HOW: Create PostgreSQLStorage if URL provided, otherwise use MemoryStorage
+	// ANCHOR: Optional PostgreSQL Storage for L7 and eBPF Events - Feb 3, 2026
+	// WHY: Enable persistent storage of L7 webhook events with NDPI enrichment AND eBPF kernel events with multi-NIC support
+	// WHAT: Check for DB_URL env var or -db-url flag, configure dual event storage backend
+	// HOW: Create PostgreSQLStorage if URL provided (routes L7 to l7_events table, eBPF to ebpf_events table), otherwise use MemoryStorage
+	// EVENT ROUTING:
+	//   - L7 events (webhook): → l7_events table with NDPI enrichment
+	//   - Connection events: → ebpf_events table with multi-NIC fields
+	//   - Packet drop events: → ebpf_events table with multi-NIC fields
+	//   - Future eBPF programs: → ebpf_events table (auto-supported via program_name field)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var pgStorage *storage.PostgreSQLStorage
 	if *dbURL != "" {
-		logger.Infof("Initializing PostgreSQL storage: %s", *dbURL)
+		logger.Infof("Initializing PostgreSQL storage with dual L7+eBPF backends: %s", *dbURL)
 		var err error
 		pgStorage, err = storage.NewPostgreSQLStorage(ctx, *dbURL)
 		if err != nil {
 			logger.Fatalf("Failed to initialize PostgreSQL storage: %v", err)
 		}
 		defer pgStorage.Close()
-		logger.Info("✅ PostgreSQL storage initialized successfully")
+		logger.Info("✅ PostgreSQL storage initialized: L7 events → l7_events table, eBPF events → ebpf_events table")
 	} else {
 		logger.Info("Using in-memory storage (set DB_URL environment variable to enable PostgreSQL)")
 	}

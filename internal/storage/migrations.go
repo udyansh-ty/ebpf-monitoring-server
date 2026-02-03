@@ -141,12 +141,128 @@ END;
 $$;
 `
 
+// ANCHOR: eBPF Event Schema - Multi-Program & Multi-NIC Ready - Feb 2, 2026
+// WHY: Persist eBPF kernel monitoring events (connections, packet drops) with multi-NIC support
+// WHAT: PostgreSQL schema with interface identification fields and multi-program tagging
+// HOW: Create table with nullable interface fields (ready for future kernel capture), optimized indexes
+
+const createEBPFEventsTable = `
+CREATE TABLE IF NOT EXISTS ebpf_events (
+  -- Event identification
+  id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,                      -- "connection", "packet_drop", etc.
+  program_name TEXT NOT NULL,                    -- "connection_tracer", "packet_drop_monitor"
+  created_at TIMESTAMP DEFAULT now(),
+  observed_at TIMESTAMP NOT NULL,
+
+  -- MULTI-NIC SUPPORT: Interface identification (nullable for phase 1A, populated in phase 1B)
+  interface_name TEXT,                           -- "eth0", "eth1", "wlan0" (indexed, nullable for now)
+  interface_index INT,                           -- Linux interface index (indexed, nullable)
+
+  -- Process information
+  pid BIGINT NOT NULL,
+  command TEXT NOT NULL,
+
+  -- Kubernetes/Container metadata (automatic enrichment)
+  k8s_node_name TEXT,
+  k8s_pod_name TEXT,
+  k8s_namespace TEXT,
+
+  -- Network information (5-tuple for flows)
+  src_ip INET,
+  dst_ip INET,
+  src_port INT,
+  dst_port INT,
+  protocol TEXT,
+  ip_version INT,
+  address_family INT,                            -- AF_INET (2) or AF_INET6 (10)
+
+  -- Connection-specific fields
+  connection_state TEXT,                         -- "established", "closed", "syn_sent", etc.
+  socket_type TEXT,                              -- "STREAM", "DGRAM", etc.
+  bytes_sent BIGINT,
+  bytes_received BIGINT,
+  duration_ms FLOAT8,                            -- Connection duration in milliseconds
+  return_code INT,                               -- System call return code
+
+  -- Packet drop-specific fields
+  drop_reason TEXT,
+  dropped_count INT,
+  drop_code INT,
+
+  -- Flexible metadata (JSONB for extensibility and future event types)
+  metadata JSONB DEFAULT '{}'::jsonb,
+
+  -- System timestamps
+  updated_at TIMESTAMP DEFAULT now()
+);
+
+-- MULTI-NIC OPTIMIZED INDEXES
+-- Filter by interface (ready for phase 1B)
+CREATE INDEX IF NOT EXISTS idx_ebpf_interface ON ebpf_events(interface_name, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ebpf_interface_idx ON ebpf_events(interface_index, observed_at DESC);
+
+-- Filter by program
+CREATE INDEX IF NOT EXISTS idx_ebpf_program ON ebpf_events(program_name, observed_at DESC);
+
+-- Filter by event type
+CREATE INDEX IF NOT EXISTS idx_ebpf_event_type ON ebpf_events(event_type, observed_at DESC);
+
+-- Network analysis
+CREATE INDEX IF NOT EXISTS idx_ebpf_src_dst ON ebpf_events(src_ip, dst_ip, interface_name);
+CREATE INDEX IF NOT EXISTS idx_ebpf_src_ip ON ebpf_events(src_ip, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ebpf_dst_ip ON ebpf_events(dst_ip, observed_at DESC);
+
+-- Process analysis
+CREATE INDEX IF NOT EXISTS idx_ebpf_pid ON ebpf_events(pid, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ebpf_command ON ebpf_events(command, observed_at DESC);
+
+-- Time-based queries
+CREATE INDEX IF NOT EXISTS idx_ebpf_time ON ebpf_events(observed_at DESC);
+
+-- Kubernetes queries (if metadata available)
+CREATE INDEX IF NOT EXISTS idx_ebpf_k8s_pod ON ebpf_events(k8s_namespace, k8s_pod_name, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ebpf_k8s_node ON ebpf_events(k8s_node_name, observed_at DESC);
+
+-- Protocol and flow analysis
+CREATE INDEX IF NOT EXISTS idx_ebpf_protocol ON ebpf_events(protocol, observed_at DESC);
+
+-- Flexible metadata queries
+CREATE INDEX IF NOT EXISTS idx_ebpf_metadata ON ebpf_events USING gin (metadata);
+
+-- Composite indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_ebpf_interface_time ON ebpf_events(interface_name, observed_at DESC, event_type);
+CREATE INDEX IF NOT EXISTS idx_ebpf_interface_pid ON ebpf_events(interface_name, pid, observed_at DESC);
+
+-- OPTIONAL: View for multi-NIC statistics
+CREATE OR REPLACE VIEW ebpf_interface_stats AS
+SELECT
+  interface_name,
+  event_type,
+  COUNT(*) as event_count,
+  COUNT(DISTINCT pid) as unique_processes,
+  COUNT(DISTINCT dst_ip) as unique_destinations,
+  SUM(COALESCE(dropped_count, 0)) as total_dropped,
+  SUM(COALESCE(bytes_sent + bytes_received, 0)) as total_bytes,
+  MIN(observed_at) as first_event,
+  MAX(observed_at) as last_event
+FROM ebpf_events
+WHERE interface_name IS NOT NULL
+GROUP BY interface_name, event_type;
+`
+
 // RunMigrations creates all required tables and indexes.
 func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 	_, err := conn.Exec(ctx, createL7EventsTable)
 	if err != nil {
 		return fmt.Errorf("failed to create l7_events table: %w", err)
 	}
+
+	_, err = conn.Exec(ctx, createEBPFEventsTable)
+	if err != nil {
+		return fmt.Errorf("failed to create ebpf_events table: %w", err)
+	}
+
 	return nil
 }
 
