@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/srodi/ebpf-server/internal/aggregator"
+	"github.com/srodi/ebpf-server/internal/events"
 	"github.com/srodi/ebpf-server/internal/l7"
+	"github.com/srodi/ebpf-server/internal/programs"
 	"github.com/srodi/ebpf-server/internal/storage"
 	"github.com/srodi/ebpf-server/pkg/logger"
 
@@ -21,8 +23,10 @@ import (
 func main() {
 	// Parse command-line flags
 	var (
-		httpAddr = flag.String("addr", ":8081", "HTTP server address")
-		dbURL    = flag.String("db-url", os.Getenv("DB_URL"), "PostgreSQL connection string (optional)")
+		httpAddr       = flag.String("addr", ":8081", "HTTP server address")
+		dbURL          = flag.String("db-url", os.Getenv("DB_URL"), "PostgreSQL connection string (optional)")
+		flowCacheTTL   = flag.Duration("flow-cache-ttl", 5*time.Minute, "Flow cache TTL for interface mapping (Phase 1B)")
+		disableEnricher = flag.Bool("disable-enricher", false, "Disable event enricher (for testing)")
 	)
 	flag.Parse()
 
@@ -52,6 +56,40 @@ func main() {
 		logger.Info("✅ PostgreSQL storage initialized: L7 events → l7_events table, eBPF events → ebpf_events table")
 	} else {
 		logger.Info("Using in-memory storage (set DB_URL environment variable to enable PostgreSQL)")
+	}
+
+	// ANCHOR: Phase 1B - TC Classifier + EventEnricher Integration - Feb 6, 2026
+	// WHY: Enable multi-NIC interface capture for connection events
+	// WHAT: Initialize InterfaceResolver and EventEnricher from TC BPF program
+	// HOW: Load TC classifier (when available), setup enricher, apply to events before storage
+	var enricher *events.EventEnricher
+
+	if !*disableEnricher {
+		// Create interface resolver (scans /sys/class/net/)
+		resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+		resolver.Start(ctx)
+		defer resolver.Stop()
+
+		logger.Info("✅ InterfaceResolver initialized: scanning /sys/class/net/ for interfaces")
+
+		// Create event enricher with configurable cache TTL
+		// BPF maps will be nil initially - set when TC program loads
+		enricher = events.NewEventEnricher(ctx, resolver, nil, logger.GetDefaultLogger(), *flowCacheTTL, true)
+
+		logger.Infof("✅ EventEnricher initialized: flow cache TTL = %v (configurable via -flow-cache-ttl)", *flowCacheTTL)
+		logger.Info("💡 Phase 1B: Ready for TC classifier BPF program (when integrated)")
+
+		// TODO: Load TC classifier BPF program when available
+		// tcProgram, err := programs.LoadTCClassifier(ctx)
+		// if err != nil {
+		//     logger.Warnf("Warning: Failed to load TC classifier: %v", err)
+		//     logger.Info("Continuing without TC interface capture (Phase 1B partial)")
+		// } else {
+		//     enricher.TestingSetBPFMaps(tcProgram.Maps())
+		//     logger.Info("✅ TC classifier loaded and enricher configured")
+		// }
+	} else {
+		logger.Info("⚠️  EventEnricher disabled (--disable-enricher flag set)")
 	}
 
 	// Create aggregator
