@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/srodi/ebpf-server/internal/core"
+	"github.com/srodi/ebpf-server/internal/events"
 	"github.com/srodi/ebpf-server/internal/storage"
 	"github.com/srodi/ebpf-server/pkg/logger"
 )
@@ -115,7 +116,8 @@ type AggregatedSummaryResponse struct {
 
 // Config represents aggregator configuration.
 type Config struct {
-	HTTPAddr string
+	HTTPAddr  string
+	Enricher  *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
 }
 
 // ProgramCache caches program information to avoid expensive queries
@@ -131,6 +133,7 @@ type Aggregator struct {
 	storage      core.EventSink
 	stats        *Stats
 	programCache *ProgramCache
+	enricher     *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
 	mu           sync.RWMutex
 	running      bool
 }
@@ -163,6 +166,7 @@ func New(config *Config) (*Aggregator, error) {
 			StartTime:    time.Now(),
 		},
 		programCache: &ProgramCache{},
+		enricher:     config.Enricher, // Use enricher from config (optional)
 	}, nil
 }
 
@@ -555,6 +559,10 @@ func (a *Aggregator) cleanupRoutine(ctx context.Context) {
 }
 
 // ingestEvent processes a single event from an agent.
+// ANCHOR: Event enrichment pipeline integration - Issue #1 Fix - Feb 6, 2026
+// WHY: Enrich connection events with interface information before storage (Phase 1B)
+// WHAT: Optionally apply enricher to extract interface_name/interface_index before storage
+// HOW: Check if enricher available and event is connection type, apply enrichment, then store
 func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage) error {
 	// Parse event data into a generic event
 	var eventMap map[string]interface{}
@@ -567,7 +575,21 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage)
 		data: eventMap,
 	}
 
-	// Store the event
+	// ANCHOR: Apply enricher to connection events - Issue #1 Fix - Feb 6, 2026
+	// WHY: Add interface information (interface_name, interface_index) to events before storage
+	// WHAT: If enricher available, attempt to enrich event with multi-NIC information
+	// HOW: Call enricher.EnrichEvent() which is non-blocking (failures don't prevent storage)
+	if a.enricher != nil {
+		enrichedEvent, err := a.enricher.EnrichEvent(ctx, event)
+		if err != nil {
+			// Non-blocking: log error but continue with storage
+			logger.Debugf("Event enrichment failed (non-blocking): %v", err)
+		} else {
+			event = enrichedEvent
+		}
+	}
+
+	// Store the event (enriched or original)
 	return a.storage.Store(ctx, event)
 }
 

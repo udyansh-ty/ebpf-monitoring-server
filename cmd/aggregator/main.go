@@ -95,6 +95,7 @@ func main() {
 	// Create aggregator
 	agg, err := aggregator.New(&aggregator.Config{
 		HTTPAddr: *httpAddr,
+		Enricher: enricher, // Pass enricher to aggregator for event pipeline integration (Phase 1B)
 	})
 	if err != nil {
 		logger.Fatalf("Failed to create aggregator: %v", err)

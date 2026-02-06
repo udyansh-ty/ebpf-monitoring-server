@@ -2,17 +2,41 @@ package events
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/srodi/ebpf-server/internal/core"
-	"github.com/srodi/ebpf-server/internal/programs"
 	"github.com/srodi/ebpf-server/pkg/logger"
 )
 
+// ANCHOR: Mock InterfaceNameResolver for testing - Issue #1 Fix - Feb 6, 2026
+// WHY: Break import cycle by avoiding import of programs package in tests
+// WHAT: Implement InterfaceNameResolver interface for test fixtures
+// HOW: Create MockInterfaceResolver that maps ifindex to predetermined names
+type MockInterfaceResolver struct {
+	mapping map[int]string
+}
+
+func NewMockInterfaceResolver() *MockInterfaceResolver {
+	return &MockInterfaceResolver{
+		mapping: map[int]string{
+			2: "eth0",
+			3: "eth1",
+			4: "wlan0",
+		},
+	}
+}
+
+func (m *MockInterfaceResolver) GetInterfaceName(ctx context.Context, ifindex int) (string, error) {
+	if name, ok := m.mapping[ifindex]; ok {
+		return name, nil
+	}
+	return "", fmt.Errorf("unknown ifindex: %d", ifindex)
+}
+
 // TestNewEventEnricher tests enricher creation.
 func TestNewEventEnricher(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	if enricher == nil {
@@ -34,7 +58,7 @@ func TestNewEventEnricher(t *testing.T) {
 
 // TestCalculateFlowKey tests flow key calculation.
 func TestCalculateFlowKey(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	tests := []struct {
@@ -74,7 +98,7 @@ func TestCalculateFlowKey(t *testing.T) {
 
 // TestEnrichEventWithoutMetadata tests enrichment of non-enrichable events.
 func TestEnrichEventWithoutMetadata(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// Event without required fields
@@ -105,7 +129,7 @@ func TestEnrichEventWithoutMetadata(t *testing.T) {
 
 // TestEnrichEventNonConnectionType tests that non-connection events are skipped.
 func TestEnrichEventNonConnectionType(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// Non-connection event
@@ -130,7 +154,7 @@ func TestEnrichEventNonConnectionType(t *testing.T) {
 
 // TestEnrichEventWithCompleteMetadata tests enrichment with all required fields.
 func TestEnrichEventWithCompleteMetadata(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// Event with complete 5-tuple
@@ -145,7 +169,7 @@ func TestEnrichEventWithCompleteMetadata(t *testing.T) {
 
 	event := NewBaseEvent("connection", 1234, "curl", uint64(time.Now().UnixNano()), metadata)
 
-	enrichedEvent, _ := enricher.EnrichEvent(context.Background(), event)
+	_, _ = enricher.EnrichEvent(context.Background(), event)
 
 	// Event should have flow key calculated (though BPF lookup returns 0)
 	// Since BPF maps are not configured, this should be a fallback enrichment
@@ -157,7 +181,7 @@ func TestEnrichEventWithCompleteMetadata(t *testing.T) {
 
 // TestEnrichEventAlreadyEnriched tests that already-enriched events are skipped.
 func TestEnrichEventAlreadyEnriched(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// Event already with interface_name
@@ -185,7 +209,7 @@ func TestEnrichEventAlreadyEnriched(t *testing.T) {
 
 // TestGetStats tests statistics tracking.
 func TestGetStats(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// Initial stats
@@ -215,7 +239,7 @@ func TestGetStats(t *testing.T) {
 
 // TestGetSuccessRate tests success rate calculation.
 func TestGetSuccessRate(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// No events processed
@@ -241,7 +265,7 @@ func TestGetSuccessRate(t *testing.T) {
 
 // TestGetAverageLatencyNs tests latency tracking.
 func TestGetAverageLatencyNs(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// No events
@@ -271,7 +295,7 @@ func TestGetAverageLatencyNs(t *testing.T) {
 
 // TestPortParsing tests port extraction from various types.
 func TestPortParsing(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	tests := []struct {
@@ -324,7 +348,7 @@ func TestPortParsing(t *testing.T) {
 
 // TestNonBlockingMode tests that enrichment failures don't block event processing.
 func TestNonBlockingMode(t *testing.T) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	// Event with missing required fields (will fail enrichment)
@@ -353,7 +377,7 @@ func TestNonBlockingMode(t *testing.T) {
 
 // BenchmarkFlowKeyCalculation benchmarks flow key calculation.
 func BenchmarkFlowKeyCalculation(b *testing.B) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	for i := 0; i < b.N; i++ {
@@ -363,7 +387,7 @@ func BenchmarkFlowKeyCalculation(b *testing.B) {
 
 // BenchmarkEnricherLatency benchmarks enrichment latency (without BPF lookups).
 func BenchmarkEnricherLatency(b *testing.B) {
-	resolver := programs.NewInterfaceResolver(logger.GetDefaultLogger())
+	resolver := NewMockInterfaceResolver()
 	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
 
 	metadata := map[string]interface{}{

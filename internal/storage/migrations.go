@@ -266,11 +266,28 @@ func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
-// DropAllTables removes all tables (for testing).
+// DropAllTables removes all tables and views (for testing).
+// ANCHOR: Complete test cleanup for Phase 1B schema - Issue #3 Fix - Feb 6, 2026
+// WHY: Tests must leave database in clean state between runs
+// WHAT: Drop all tables and dependent views created by migrations
+// HOW: Drop ebpf_interface_stats view first (depends on ebpf_events), then tables
 func DropAllTables(ctx context.Context, conn *pgx.Conn) error {
-	_, err := conn.Exec(ctx, `DROP TABLE IF EXISTS l7_events CASCADE;`)
+	// Drop views first (depends on tables)
+	_, err := conn.Exec(ctx, `DROP VIEW IF EXISTS ebpf_interface_stats CASCADE;`)
 	if err != nil {
-		return fmt.Errorf("failed to drop tables: %w", err)
+		return fmt.Errorf("failed to drop ebpf_interface_stats view: %w", err)
 	}
+
+	// Drop tables
+	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS ebpf_events CASCADE;`)
+	if err != nil {
+		return fmt.Errorf("failed to drop ebpf_events table: %w", err)
+	}
+
+	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS l7_events CASCADE;`)
+	if err != nil {
+		return fmt.Errorf("failed to drop l7_events table: %w", err)
+	}
+
 	return nil
 }

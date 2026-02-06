@@ -4,13 +4,13 @@ package events
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
+	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/srodi/ebpf-server/internal/core"
-	"github.com/srodi/ebpf-server/internal/programs"
 	"github.com/srodi/ebpf-server/pkg/logger"
 )
 
@@ -19,13 +19,21 @@ import (
 // WHAT: Lookup interface from TC classifier BPF maps, resolve to name, enrich event
 // HOW: Create enricher that intercepts events, performs lookup+resolution, returns enriched event
 
+// ANCHOR: InterfaceNameResolver interface to break import cycle - Issue #1 Fix - Feb 6, 2026
+// WHY: programs.BaseProgram already imports events, creating a cycle if enricher imports programs
+// WHAT: Define interface for interface name resolution instead of concrete type dependency
+// HOW: Accept InterfaceNameResolver interface instead of *programs.InterfaceResolver concrete type
+type InterfaceNameResolver interface {
+	GetInterfaceName(ctx context.Context, ifindex int) (string, error)
+}
+
 // EventEnricher enriches connection events with interface information.
 // It looks up the flow in TC classifier BPF maps and resolves the interface
 // index to a human-readable name (e.g., "eth0", "eth1").
 type EventEnricher struct {
-	resolver         *programs.InterfaceResolver
-	bpfMaps          map[string]interface{} // BPF maps from TC classifier
-	log              logger.Logger
+	resolver         InterfaceNameResolver   // Interface-based to break import cycle
+	bpfMaps          map[string]interface{}  // BPF maps from TC classifier
+	log              *logger.Logger          // Pointer to logger instance
 	stats            *EnricherStats
 	flowCacheTTL     time.Duration // Time to live for flow cache (configurable)
 	nonBlockingMode  bool           // If true, enrichment failures don't block events
@@ -46,13 +54,13 @@ type EnricherStats struct {
 }
 
 // NewEventEnricher creates a new event enricher.
-// resolver: Interface resolver for ifindex → name mapping
+// resolver: Interface resolver for ifindex → name mapping (must implement InterfaceNameResolver)
 // bpfMaps: BPF maps from TC classifier program (optional, can be nil)
-// log: Logger instance
+// log: Logger instance pointer
 // flowCacheTTL: How long to keep flow→interface mappings (configurable, recommended 5 minutes)
 // nonBlockingMode: If true, enrichment failures don't block event processing
-func NewEventEnricher(ctx context.Context, resolver *programs.InterfaceResolver,
-	bpfMaps map[string]interface{}, log logger.Logger,
+func NewEventEnricher(ctx context.Context, resolver InterfaceNameResolver,
+	bpfMaps map[string]interface{}, log *logger.Logger,
 	flowCacheTTL time.Duration, nonBlockingMode bool) *EventEnricher {
 
 	if flowCacheTTL == 0 {
@@ -153,18 +161,94 @@ func (e *EventEnricher) EnrichEvent(ctx context.Context, event core.Event) (core
 // This must match the flow key calculation in the BPF program exactly.
 // Used as key for BPF map lookups.
 //
+// ANCHOR: FNV-1a Hash Matching BPF Program - Issue #2 Fix - Feb 6, 2026
+// WHY: Userspace must hash the 5-tuple identically to BPF to correlate flows
+// WHAT: Convert IP strings to raw bytes, protocol string to numeric value, hash like BPF
+// HOW: Parse IP addresses to u32, convert protocol to IPPROTO_* value, extract bytes with bit shifts
+//
 // Flow key = FNV-1a hash of (src_ip, dst_ip, src_port, dst_port, protocol)
+// where each field is represented as raw bytes (matching BPF program's fnv1a_hash)
 func (e *EventEnricher) CalculateFlowKey(srcIP, dstIP string, srcPort, dstPort uint16, protocol string) (uint64, error) {
-	h := fnv.New64a()
+	// ANCHOR: Convert IP strings to uint32 - Issue #2 Fix - Feb 6, 2026
+	// WHY: BPF program uses u32 for IPs (32-bit network format)
+	// WHAT: Parse dotted-quad strings to net.IP, convert to 32-bit integers
+	// HOW: Use net.ParseIP().To4(), extract bytes as big-endian u32
 
-	// Hash each field in order
-	h.Write([]byte(srcIP))
-	h.Write([]byte(dstIP))
-	h.Write([]byte{byte(srcPort >> 8), byte(srcPort)})
-	h.Write([]byte{byte(dstPort >> 8), byte(dstPort)})
-	h.Write([]byte(protocol))
+	srcIPParsed := net.ParseIP(srcIP)
+	if srcIPParsed == nil || srcIPParsed.To4() == nil {
+		return 0, fmt.Errorf("invalid source IP: %s", srcIP)
+	}
+	dstIPParsed := net.ParseIP(dstIP)
+	if dstIPParsed == nil || dstIPParsed.To4() == nil {
+		return 0, fmt.Errorf("invalid destination IP: %s", dstIP)
+	}
 
-	return h.Sum64(), nil
+	// Convert to 32-bit unsigned integers (network byte order: big-endian)
+	srcIPBytes := srcIPParsed.To4()
+	dstIPBytes := dstIPParsed.To4()
+
+	srcIPu32 := (uint32(srcIPBytes[0]) << 24) | (uint32(srcIPBytes[1]) << 16) |
+		(uint32(srcIPBytes[2]) << 8) | uint32(srcIPBytes[3])
+	dstIPu32 := (uint32(dstIPBytes[0]) << 24) | (uint32(dstIPBytes[1]) << 16) |
+		(uint32(dstIPBytes[2]) << 8) | uint32(dstIPBytes[3])
+
+	// ANCHOR: Convert protocol string to numeric value - Issue #2 Fix - Feb 6, 2026
+	// WHY: BPF program uses IPPROTO_* enum values (17=UDP, 6=TCP), not strings
+	// WHAT: Map protocol string to its numeric IPPROTO_* value
+	// HOW: Use strconv or simple string comparison to protocol number
+
+	var protocolNum uint8
+	switch protocol {
+	case "tcp":
+		protocolNum = 6 // IPPROTO_TCP
+	case "udp":
+		protocolNum = 17 // IPPROTO_UDP
+	case "icmp":
+		protocolNum = 1 // IPPROTO_ICMP
+	case "icmpv6":
+		protocolNum = 58 // IPPROTO_ICMPV6
+	default:
+		// Try to parse as number
+		num, err := strconv.ParseInt(protocol, 10, 8)
+		if err != nil {
+			return 0, fmt.Errorf("unknown protocol: %s", protocol)
+		}
+		protocolNum = uint8(num)
+	}
+
+	// ANCHOR: FNV-1a hash matching BPF implementation - Issue #2 Fix - Feb 6, 2026
+	// WHY: Must produce identical hash to BPF fnv1a_hash() function
+	// WHAT: Hash raw bytes in same order as BPF (src_ip 4 bytes, dst_ip 4 bytes, ports, protocol)
+	// HOW: Extract individual bytes from u32 using bit shifts, feed to FNV-1a hasher
+
+	const fnvOffset uint64 = 0xcbf29ce484222325
+	const fnvPrime uint64 = 0x100000001b3
+
+	hash := fnvOffset
+
+	// Hash each byte of src_ip (4 bytes, big-endian)
+	for i := 0; i < 4; i++ {
+		hash ^= uint64((srcIPu32 >> (uint(i) * 8)) & 0xFF)
+		hash *= fnvPrime
+
+		hash ^= uint64((dstIPu32 >> (uint(i) * 8)) & 0xFF)
+		hash *= fnvPrime
+
+		// Hash ports (only 2 bytes each, so i < 2 condition)
+		if i < 2 {
+			hash ^= uint64((uint32(srcPort) >> (uint(i) * 8)) & 0xFF)
+			hash *= fnvPrime
+
+			hash ^= uint64((uint32(dstPort) >> (uint(i) * 8)) & 0xFF)
+			hash *= fnvPrime
+		}
+	}
+
+	// Hash protocol byte
+	hash ^= uint64(protocolNum)
+	hash *= fnvPrime
+
+	return hash, nil
 }
 
 // calculateFlowKey extracts 5-tuple from event metadata and computes flow key.
