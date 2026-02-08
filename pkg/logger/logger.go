@@ -54,6 +54,17 @@ func Infof(format string, v ...interface{}) {
 	defaultLogger.logger.Printf(format, v...)
 }
 
+// Warn logs a warning message
+func Warn(v ...interface{}) {
+	args := append([]interface{}{"[WARN] "}, v...)
+	defaultLogger.logger.Print(args...)
+}
+
+// Warnf logs a formatted warning message
+func Warnf(format string, v ...interface{}) {
+	defaultLogger.logger.Printf("[WARN] "+format, v...)
+}
+
 // Debug logs a debug message (only when debug level is enabled)
 func Debug(v ...interface{}) {
 	if defaultLogger.level >= DEBUG {

@@ -79,15 +79,15 @@ func main() {
 		logger.Infof("✅ EventEnricher initialized: flow cache TTL = %v (configurable via -flow-cache-ttl)", *flowCacheTTL)
 		logger.Info("💡 Phase 1B: Ready for TC classifier BPF program (when integrated)")
 
-		// TODO: Load TC classifier BPF program when available
-		// tcProgram, err := programs.LoadTCClassifier(ctx)
-		// if err != nil {
-		//     logger.Warnf("Warning: Failed to load TC classifier: %v", err)
-		//     logger.Info("Continuing without TC interface capture (Phase 1B partial)")
-		// } else {
-		//     enricher.TestingSetBPFMaps(tcProgram.Maps())
-		//     logger.Info("✅ TC classifier loaded and enricher configured")
-		// }
+		tcProgram, err := programs.LoadTCClassifier(ctx)
+		if err != nil {
+			logger.Warnf("Failed to load TC classifier (optional): %v", err)
+			logger.Info("Continuing without TC interface capture (Phase 1B partial)")
+		} else {
+			enricher.TestingSetBPFMaps(tcProgram.Maps())
+			defer tcProgram.Close()
+			logger.Info("✅ TC classifier loaded and enricher configured")
+		}
 	} else {
 		logger.Info("⚠️  EventEnricher disabled (--disable-enricher flag set)")
 	}

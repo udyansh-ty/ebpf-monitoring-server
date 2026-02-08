@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/srodi/ebpf-server/pkg/logger"
 )
 
@@ -143,6 +144,53 @@ func TestCalculateFlowKeyIPv6Metadata(t *testing.T) {
 	if key1 != key2 {
 		t.Fatalf("IPv6 flow key should be deterministic, got %d vs %d", key1, key2)
 	}
+}
+
+// TestLookupFlowInBPFMap verifies that a mock flow map returns the correct interface index.
+func TestLookupFlowInBPFMap(t *testing.T) {
+	resolver := NewMockInterfaceResolver()
+	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
+
+	const flowKey = uint64(0xdeadbeef)
+	enricher.TestingSetBPFMaps(map[string]interface{}{
+		"flow_to_interface": &testFlowMap{
+			data: map[uint64]flowMetadata{
+				flowKey: {Ifindex: 5},
+			},
+		},
+	})
+
+	if idx := enricher.lookupFlowInBPFMap(flowKey); idx != 5 {
+		t.Fatalf("expected interface index 5, got %d", idx)
+	}
+
+	if idx := enricher.lookupFlowInBPFMap(flowKey + 1); idx != 0 {
+		t.Fatalf("expected missing flow to return 0, got %d", idx)
+	}
+}
+
+type testFlowMap struct {
+	data map[uint64]flowMetadata
+}
+
+func (m *testFlowMap) Lookup(key interface{}, value interface{}) error {
+	flowKey, ok := key.(uint64)
+	if !ok {
+		return fmt.Errorf("expected uint64 key, got %T", key)
+	}
+
+	metadata, ok := m.data[flowKey]
+	if !ok {
+		return ebpf.ErrKeyNotExist
+	}
+
+	ptr, ok := value.(*flowMetadata)
+	if !ok {
+		return fmt.Errorf("expected *flowMetadata value, got %T", value)
+	}
+
+	*ptr = metadata
+	return nil
 }
 
 // TestEnrichEventWithoutMetadata tests enrichment of non-enrichable events.

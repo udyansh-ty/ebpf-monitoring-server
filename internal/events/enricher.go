@@ -4,6 +4,7 @@ package events
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/pkg/logger"
 )
@@ -401,11 +403,27 @@ func (e *EventEnricher) getPortFromMetadata(metadata map[string]interface{}, fie
 // TODO: Implement with libbpf or cilium/ebpf package
 // This requires accessing the BPF maps from the TC classifier program
 func (e *EventEnricher) lookupFlowInBPFMap(flowKey uint64) int {
-	// TODO: Implement actual BPF map lookup
-	// This would use cilium/ebpf or libbpf to query the flow_to_interface map
-	// For Phase 1B initial implementation, we return 0 (lookup not implemented)
-	// In subsequent phases, this will be replaced with actual lookup
-	return 0
+	lookup := e.getFlowMapLookup()
+	if lookup == nil {
+		return 0
+	}
+
+	var metadata flowMetadata
+	if err := lookup.Lookup(flowKey, &metadata); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return 0
+		}
+		if e.log != nil {
+			e.log.Debugf("Flow map lookup error: %v", err)
+		}
+		return 0
+	}
+
+	if metadata.Ifindex == 0 {
+		return 0
+	}
+
+	return int(metadata.Ifindex)
 }
 
 // GetStats returns current enrichment statistics.
@@ -482,4 +500,38 @@ func (e *EventEnricher) recordLatency(latencyNs int64) {
 // This should only be used in tests to mock BPF maps.
 func (e *EventEnricher) TestingSetBPFMaps(maps map[string]interface{}) {
 	e.bpfMaps = maps
+}
+
+func (e *EventEnricher) getFlowMapLookup() bpfLookup {
+	if e.bpfMaps == nil {
+		return nil
+	}
+
+	raw, ok := e.bpfMaps["flow_to_interface"]
+	if !ok {
+		return nil
+	}
+
+	if lookup, ok := raw.(bpfLookup); ok {
+		return lookup
+	}
+	if m, ok := raw.(*ebpf.Map); ok {
+		return m
+	}
+
+	return nil
+}
+
+type bpfLookup interface {
+	Lookup(key interface{}, value interface{}) error
+}
+
+type flowMetadata struct {
+	Ifindex   uint32
+	Timestamp uint64
+	SrcPort   uint16
+	DstPort   uint16
+	Protocol  uint8
+	IPVersion uint8
+	_pad      uint16
 }
