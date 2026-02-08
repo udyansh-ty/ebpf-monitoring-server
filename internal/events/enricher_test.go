@@ -71,7 +71,7 @@ func TestCalculateFlowKey(t *testing.T) {
 	}{
 		{"192.168.1.100", "8.8.8.8", 50000, 53, "udp", "DNS query"},
 		{"10.0.0.1", "10.0.0.2", 80, 12345, "tcp", "HTTP response"},
-		{"192.168.1.1", "192.168.1.1", 0, 0, "icmp", "ICMP request"},
+		{"192.168.1.1", "198.51.100.2", 7, 0, "icmp", "ICMP request"},
 	}
 
 	for _, tt := range tests {
@@ -93,6 +93,55 @@ func TestCalculateFlowKey(t *testing.T) {
 				t.Error("expected different keys for different 5-tuples")
 			}
 		})
+	}
+}
+
+// TestCalculateFlowKeyProtocolCaseInsensitive ensures both uppercase and lowercase protocol strings hash identically.
+func TestCalculateFlowKeyProtocolCaseInsensitive(t *testing.T) {
+	resolver := NewMockInterfaceResolver()
+	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
+
+	keyLower, err := enricher.CalculateFlowKey("192.0.2.1", "198.51.100.1", 5000, 80, "tcp")
+	if err != nil {
+		t.Fatalf("unexpected error for lowercase protocol: %v", err)
+	}
+
+	keyUpper, err := enricher.CalculateFlowKey("192.0.2.1", "198.51.100.1", 5000, 80, "TCP")
+	if err != nil {
+		t.Fatalf("unexpected error for uppercase protocol: %v", err)
+	}
+
+	if keyLower != keyUpper {
+		t.Fatalf("expected case-insensitive hashing; got %d vs %d", keyLower, keyUpper)
+	}
+}
+
+// TestCalculateFlowKeyIPv6Metadata ensures IPv6 metadata is accepted and deterministic.
+func TestCalculateFlowKeyIPv6Metadata(t *testing.T) {
+	resolver := NewMockInterfaceResolver()
+	enricher := NewEventEnricher(context.Background(), resolver, nil, logger.GetDefaultLogger(), 5*time.Minute, true)
+
+	metadata := map[string]interface{}{
+		"src_ip":     "2001:db8::1",
+		"dst_ip":     "2001:db8::2",
+		"src_port":   float64(40000),
+		"dst_port":   float64(443),
+		"protocol":   "tcp",
+		"ip_version": float64(6),
+	}
+
+	key1, err := enricher.calculateFlowKey(metadata)
+	if err != nil {
+		t.Fatalf("IPv6 flow key calculation failed: %v", err)
+	}
+
+	key2, err := enricher.calculateFlowKey(metadata)
+	if err != nil {
+		t.Fatalf("IPv6 flow key recalculation failed: %v", err)
+	}
+
+	if key1 != key2 {
+		t.Fatalf("IPv6 flow key should be deterministic, got %d vs %d", key1, key2)
 	}
 }
 

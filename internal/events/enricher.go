@@ -3,9 +3,11 @@ package events
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -157,98 +159,15 @@ func (e *EventEnricher) EnrichEvent(ctx context.Context, event core.Event) (core
 	return event, nil
 }
 
-// CalculateFlowKey calculates a deterministic flow key from the 5-tuple.
-// This must match the flow key calculation in the BPF program exactly.
-// Used as key for BPF map lookups.
-//
-// ANCHOR: FNV-1a Hash Matching BPF Program - Issue #2 Fix - Feb 6, 2026
-// WHY: Userspace must hash the 5-tuple identically to BPF to correlate flows
-// WHAT: Convert IP strings to raw bytes, protocol string to numeric value, hash like BPF
-// HOW: Parse IP addresses to u32, convert protocol to IPPROTO_* value, extract bytes with bit shifts
-//
-// Flow key = FNV-1a hash of (src_ip, dst_ip, src_port, dst_port, protocol)
-// where each field is represented as raw bytes (matching BPF program's fnv1a_hash)
+// CalculateFlowKey calculates a deterministic flow key from the 5-tuple for IPv4.
+// This matches the BPF fnv1a_hash() implementation.
 func (e *EventEnricher) CalculateFlowKey(srcIP, dstIP string, srcPort, dstPort uint16, protocol string) (uint64, error) {
-	// ANCHOR: Convert IP strings to uint32 - Issue #2 Fix - Feb 6, 2026
-	// WHY: BPF program uses u32 for IPs (32-bit network format)
-	// WHAT: Parse dotted-quad strings to net.IP, convert to 32-bit integers
-	// HOW: Use net.ParseIP().To4(), extract bytes as big-endian u32
-
-	srcIPParsed := net.ParseIP(srcIP)
-	if srcIPParsed == nil || srcIPParsed.To4() == nil {
-		return 0, fmt.Errorf("invalid source IP: %s", srcIP)
-	}
-	dstIPParsed := net.ParseIP(dstIP)
-	if dstIPParsed == nil || dstIPParsed.To4() == nil {
-		return 0, fmt.Errorf("invalid destination IP: %s", dstIP)
+	protocolNum, err := parseProtocolString(protocol)
+	if err != nil {
+		return 0, err
 	}
 
-	// Convert to 32-bit unsigned integers (network byte order: big-endian)
-	srcIPBytes := srcIPParsed.To4()
-	dstIPBytes := dstIPParsed.To4()
-
-	srcIPu32 := (uint32(srcIPBytes[0]) << 24) | (uint32(srcIPBytes[1]) << 16) |
-		(uint32(srcIPBytes[2]) << 8) | uint32(srcIPBytes[3])
-	dstIPu32 := (uint32(dstIPBytes[0]) << 24) | (uint32(dstIPBytes[1]) << 16) |
-		(uint32(dstIPBytes[2]) << 8) | uint32(dstIPBytes[3])
-
-	// ANCHOR: Convert protocol string to numeric value - Issue #2 Fix - Feb 6, 2026
-	// WHY: BPF program uses IPPROTO_* enum values (17=UDP, 6=TCP), not strings
-	// WHAT: Map protocol string to its numeric IPPROTO_* value
-	// HOW: Use strconv or simple string comparison to protocol number
-
-	var protocolNum uint8
-	switch protocol {
-	case "tcp":
-		protocolNum = 6 // IPPROTO_TCP
-	case "udp":
-		protocolNum = 17 // IPPROTO_UDP
-	case "icmp":
-		protocolNum = 1 // IPPROTO_ICMP
-	case "icmpv6":
-		protocolNum = 58 // IPPROTO_ICMPV6
-	default:
-		// Try to parse as number
-		num, err := strconv.ParseInt(protocol, 10, 8)
-		if err != nil {
-			return 0, fmt.Errorf("unknown protocol: %s", protocol)
-		}
-		protocolNum = uint8(num)
-	}
-
-	// ANCHOR: FNV-1a hash matching BPF implementation - Issue #2 Fix - Feb 6, 2026
-	// WHY: Must produce identical hash to BPF fnv1a_hash() function
-	// WHAT: Hash raw bytes in same order as BPF (src_ip 4 bytes, dst_ip 4 bytes, ports, protocol)
-	// HOW: Extract individual bytes from u32 using bit shifts, feed to FNV-1a hasher
-
-	const fnvOffset uint64 = 0xcbf29ce484222325
-	const fnvPrime uint64 = 0x100000001b3
-
-	hash := fnvOffset
-
-	// Hash each byte of src_ip (4 bytes, big-endian)
-	for i := 0; i < 4; i++ {
-		hash ^= uint64((srcIPu32 >> (uint(i) * 8)) & 0xFF)
-		hash *= fnvPrime
-
-		hash ^= uint64((dstIPu32 >> (uint(i) * 8)) & 0xFF)
-		hash *= fnvPrime
-
-		// Hash ports (only 2 bytes each, so i < 2 condition)
-		if i < 2 {
-			hash ^= uint64((uint32(srcPort) >> (uint(i) * 8)) & 0xFF)
-			hash *= fnvPrime
-
-			hash ^= uint64((uint32(dstPort) >> (uint(i) * 8)) & 0xFF)
-			hash *= fnvPrime
-		}
-	}
-
-	// Hash protocol byte
-	hash ^= uint64(protocolNum)
-	hash *= fnvPrime
-
-	return hash, nil
+	return e.hashFlowKeyV4(srcIP, dstIP, srcPort, dstPort, protocolNum)
 }
 
 // calculateFlowKey extracts 5-tuple from event metadata and computes flow key.
@@ -276,18 +195,177 @@ func (e *EventEnricher) calculateFlowKey(metadata map[string]interface{}) (uint6
 		return 0, fmt.Errorf("missing or invalid dst_port")
 	}
 
-	protocol, ok := metadata["protocol"].(string)
-	if !ok || protocol == "" {
-		return 0, fmt.Errorf("missing or invalid protocol")
+	protocolNum, err := e.extractProtocolNumber(metadata)
+	if err != nil {
+		return 0, err
 	}
 
-	// Calculate flow key
-	flowKey, err := e.CalculateFlowKey(srcIP, dstIP, uint16(srcPort), uint16(dstPort), protocol)
+	ipVersion := e.getIPVersion(metadata)
+
+	if ipVersion == 6 {
+		return e.hashFlowKeyV6(srcIP, dstIP, uint16(srcPort), uint16(dstPort), protocolNum)
+	}
+
+	flowKey, err := e.hashFlowKeyV4(srcIP, dstIP, uint16(srcPort), uint16(dstPort), protocolNum)
 	if err != nil {
 		return 0, err
 	}
 
 	return flowKey, nil
+}
+
+func (e *EventEnricher) getIPVersion(metadata map[string]interface{}) int {
+	if v, ok := metadata["ip_version"].(float64); ok && v >= 4 {
+		return int(v)
+	}
+	if v, ok := metadata["ip_version"].(int); ok && v >= 4 {
+		return v
+	}
+	if v, ok := metadata["ip_version"].(string); ok {
+		if strings.Contains(v, "6") {
+			return 6
+		}
+	}
+	return 4
+}
+
+func (e *EventEnricher) extractProtocolNumber(metadata map[string]interface{}) (uint8, error) {
+	if raw, ok := metadata["protocol"]; ok {
+		if num, err := parseProtocolValue(raw); err == nil {
+			return num, nil
+		}
+	}
+	if raw, ok := metadata["raw_protocol"]; ok {
+		if num, err := parseProtocolValue(raw); err == nil {
+			return num, nil
+		}
+	}
+	if raw, ok := metadata["protocol_number"]; ok {
+		if num, err := parseProtocolValue(raw); err == nil {
+			return num, nil
+		}
+	}
+
+	return 0, fmt.Errorf("missing or invalid protocol")
+}
+
+func parseProtocolValue(value interface{}) (uint8, error) {
+	switch v := value.(type) {
+	case string:
+		return parseProtocolString(v)
+	case float64:
+		return uint8(v), nil
+	case int:
+		return uint8(v), nil
+	case uint8:
+		return v, nil
+	case uint16:
+		return uint8(v), nil
+	case uint32:
+		return uint8(v), nil
+	default:
+		return 0, fmt.Errorf("unknown protocol type: %T", value)
+	}
+}
+
+func parseProtocolString(protocol string) (uint8, error) {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "tcp":
+		return 6, nil
+	case "udp":
+		return 17, nil
+	case "icmp":
+		return 1, nil
+	case "icmpv6":
+		return 58, nil
+	default:
+		num, err := strconv.ParseUint(protocol, 10, 8)
+		if err != nil {
+			return 0, fmt.Errorf("unknown protocol: %s", protocol)
+		}
+		return uint8(num), nil
+	}
+}
+
+func (e *EventEnricher) hashFlowKeyV4(srcIP, dstIP string, srcPort, dstPort uint16, protocolNum uint8) (uint64, error) {
+	srcIPParsed := net.ParseIP(srcIP)
+	if srcIPParsed == nil || srcIPParsed.To4() == nil {
+		return 0, fmt.Errorf("invalid source IP: %s", srcIP)
+	}
+	dstIPParsed := net.ParseIP(dstIP)
+	if dstIPParsed == nil || dstIPParsed.To4() == nil {
+		return 0, fmt.Errorf("invalid destination IP: %s", dstIP)
+	}
+
+	srcIPu32 := binary.BigEndian.Uint32(srcIPParsed.To4())
+	dstIPu32 := binary.BigEndian.Uint32(dstIPParsed.To4())
+
+	const fnvOffset uint64 = 0xcbf29ce484222325
+	const fnvPrime uint64 = 0x100000001b3
+
+	hash := fnvOffset
+
+	for i := 0; i < 4; i++ {
+		hash ^= uint64((srcIPu32 >> (uint(i) * 8)) & 0xFF)
+		hash *= fnvPrime
+
+		hash ^= uint64((dstIPu32 >> (uint(i) * 8)) & 0xFF)
+		hash *= fnvPrime
+
+		if i < 2 {
+			hash ^= uint64((uint32(srcPort) >> (uint(i) * 8)) & 0xFF)
+			hash *= fnvPrime
+
+			hash ^= uint64((uint32(dstPort) >> (uint(i) * 8)) & 0xFF)
+			hash *= fnvPrime
+		}
+	}
+
+	hash ^= uint64(protocolNum)
+	hash *= fnvPrime
+
+	return hash, nil
+}
+
+func (e *EventEnricher) hashFlowKeyV6(srcIP, dstIP string, srcPort, dstPort uint16, protocolNum uint8) (uint64, error) {
+	srcIPParsed := net.ParseIP(srcIP)
+	if srcIPParsed == nil || srcIPParsed.To16() == nil {
+		return 0, fmt.Errorf("invalid source IPv6: %s", srcIP)
+	}
+	dstIPParsed := net.ParseIP(dstIP)
+	if dstIPParsed == nil || dstIPParsed.To16() == nil {
+		return 0, fmt.Errorf("invalid destination IPv6: %s", dstIP)
+	}
+
+	srcBytes := srcIPParsed.To16()
+	dstBytes := dstIPParsed.To16()
+
+	const fnvOffset uint64 = 0xcbf29ce484222325
+	const fnvPrime uint64 = 0x100000001b3
+
+	hash := fnvOffset
+
+	for i := 0; i < 4; i++ {
+		srcChunk := binary.BigEndian.Uint32(srcBytes[i*4 : i*4+4])
+		dstChunk := binary.BigEndian.Uint32(dstBytes[i*4 : i*4+4])
+
+		hash ^= uint64(srcChunk)
+		hash *= fnvPrime
+
+		hash ^= uint64(dstChunk)
+		hash *= fnvPrime
+	}
+
+	hash ^= uint64(srcPort)
+	hash *= fnvPrime
+
+	hash ^= uint64(dstPort)
+	hash *= fnvPrime
+
+	hash ^= uint64(protocolNum)
+	hash *= fnvPrime
+
+	return hash, nil
 }
 
 // getPortFromMetadata extracts a port number from metadata.
