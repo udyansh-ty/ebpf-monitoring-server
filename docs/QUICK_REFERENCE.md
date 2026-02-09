@@ -1,4 +1,14 @@
-# Multi-NIC & Multi-Program Support - Quick Reference
+# Quick Reference Guide - eBPF Network Monitor
+
+## Version 2.0 - With Authentication & Service Layer
+
+> **Updated**: February 2025
+> **Status**: Phase 1-2 Implementation Complete
+> **Features**: JWT Auth, Service Layer, Repository Pattern, Multi-NIC Ready
+
+---
+
+## Multi-NIC & Multi-Program Support - Quick Reference
 
 ## The Answer to Your Question
 
@@ -247,11 +257,96 @@ GROUP BY interface_name, drop_reason;
 
 ---
 
+---
+
+## Phase 1-2: Authentication & Service Layer
+
+### What's New (February 2025)
+
+#### Authentication (Phase 1)
+- **JWT Tokens**: Access token (24h) + Refresh token (7 days)
+- **Authentication Endpoints**:
+  - `POST /api/auth/login` - Request tokens with username/password
+  - `POST /api/auth/refresh` - Refresh expired access token
+- **Protected Routes**: All API endpoints except `/health` require Bearer token
+
+#### Service Layer (Phase 2)
+- **Clean Abstraction**: Business logic separated from HTTP handlers
+- **Service Interfaces**: ProgramService, EventService, HealthService
+- **Repository Pattern**: EventRepository for pluggable data storage
+- **Dependency Injection**: ServiceFactory for service composition
+
+### Getting Started with Authentication
+
+#### 1. Login and Get Tokens
+```bash
+curl -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"user","password":"password"}'
+
+# Response:
+# {
+#   "access_token": "eyJhbGc...",
+#   "refresh_token": "eyJhbGc...",
+#   "token_type": "Bearer",
+#   "expires_at": "2025-02-10T07:47:00Z"
+# }
+```
+
+#### 2. Use Access Token in Requests
+```bash
+curl -X GET http://localhost:8080/api/programs \
+  -H "Authorization: Bearer <access_token>"
+```
+
+#### 3. Refresh Token When Expired
+```bash
+curl -X POST http://localhost:8080/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"<refresh_token>"}'
+```
+
+### Service Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  HTTP Handlers (REST API)                   │
+├─────────────────────────────────────────────┤
+│  Service Layer (Business Logic)             │
+│  ├─ ProgramService                          │
+│  ├─ EventService                            │
+│  └─ HealthService                           │
+├─────────────────────────────────────────────┤
+│  Repository Layer (Data Access)             │
+│  └─ EventRepository (interface)             │
+│     └─ MemoryEventRepository (impl)         │
+├─────────────────────────────────────────────┤
+│  System (Core Monitoring)                   │
+│  ├─ Program Manager                         │
+│  ├─ Event Processing                        │
+│  └─ Health Checks                           │
+└─────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | Type | Purpose | Status |
+|-----------|------|---------|--------|
+| JWT Tokens | Auth | Secure API access | ✅ Implemented |
+| AuthMiddleware | Middleware | Token validation | ✅ Implemented |
+| ServiceFactory | Pattern | Service composition | ✅ Implemented |
+| EventRepository | Interface | Data access abstraction | ✅ Implemented |
+| MemoryEventRepository | Implementation | Development storage | ✅ Implemented |
+
+---
+
 ## Status
 
 ✅ **Analysis Complete**
 ✅ **Database Design Complete**
 ✅ **Multi-NIC Strategy Defined**
 ✅ **Implementation Ready**
+✅ **Phase 1 Complete** - JWT Authentication + Middleware
+✅ **Phase 2 Complete** - Service Layer + Repository Pattern
 
-**Next Action**: Approve and proceed with Phase 1 implementation
+**Next Action**: See API_REST.md for endpoint details and usage examples
