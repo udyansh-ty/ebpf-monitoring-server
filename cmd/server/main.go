@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/srodi/ebpf-server/internal/api"
+	"github.com/srodi/ebpf-server/internal/auth"
+	"github.com/srodi/ebpf-server/internal/middleware"
 	"github.com/srodi/ebpf-server/internal/system"
 	"github.com/srodi/ebpf-server/pkg/logger"
 
@@ -20,9 +23,16 @@ import (
 func main() {
 	// Parse command-line flags
 	var (
-		httpAddr = flag.String("addr", ":8080", "HTTP server address")
+		httpAddr  = flag.String("addr", ":8080", "HTTP server address")
+		jwtSecret = flag.String("jwt-secret", os.Getenv("JWT_SECRET"), "JWT signing secret")
 	)
 	flag.Parse()
+
+	// Validate JWT secret
+	if *jwtSecret == "" {
+		fmt.Fprintf(os.Stderr, "WARNING: JWT_SECRET not set, generating random secret\n")
+		*jwtSecret = auth.GenerateSecret()
+	}
 
 	// Check if debug logging is enabled
 	logger.Info("Starting eBPF Network Monitor...")
@@ -61,19 +71,33 @@ func main() {
 		cancel()
 	}()
 
+	// Initialize token generator
+	tokenGen := auth.NewTokenGenerator(&auth.JWTConfig{
+		SigningKey: *jwtSecret,
+	})
+
 	// Setup HTTP routes
 	mux := http.NewServeMux()
 
-	// API endpoints
-	mux.HandleFunc("/api/connection-summary", api.HandleConnectionSummary)
-	mux.HandleFunc("/api/packet-drop-summary", api.HandlePacketDropSummary)
-	mux.HandleFunc("/api/list-connections", api.HandleListConnections)
-	mux.HandleFunc("/api/list-packet-drops", api.HandleListPacketDrops)
+	// Auth endpoints (no middleware)
+	mux.HandleFunc("/api/auth/login", api.HandleLogin(tokenGen))
+	mux.HandleFunc("/api/auth/refresh", api.HandleRefresh(tokenGen))
+
+	// Health check (no middleware)
 	mux.HandleFunc("/health", api.HandleHealth)
 
-	// New auto-generated API endpoints
-	mux.HandleFunc("/api/programs", api.HandlePrograms)
-	mux.HandleFunc("/api/events", api.HandleEvents)
+	// Wire auth middleware
+	authMW := middleware.AuthMiddleware(tokenGen)
+
+	// Protected API endpoints (with middleware)
+	mux.Handle("/api/connection-summary", authMW(http.HandlerFunc(api.HandleConnectionSummary)))
+	mux.Handle("/api/packet-drop-summary", authMW(http.HandlerFunc(api.HandlePacketDropSummary)))
+	mux.Handle("/api/list-connections", authMW(http.HandlerFunc(api.HandleListConnections)))
+	mux.Handle("/api/list-packet-drops", authMW(http.HandlerFunc(api.HandleListPacketDrops)))
+
+	// New auto-generated API endpoints (with middleware)
+	mux.Handle("/api/programs", authMW(http.HandlerFunc(api.HandlePrograms)))
+	mux.Handle("/api/events", authMW(http.HandlerFunc(api.HandleEvents)))
 
 	// Swagger documentation
 	mux.HandleFunc("/docs/", httpSwagger.WrapHandler)
@@ -112,10 +136,16 @@ func main() {
 
 	logger.Infof("Starting eBPF Network Monitor HTTP API on %s...", *httpAddr)
 
+	// Create middleware stack
+	handler := http.Handler(mux)
+	handler = middleware.ErrorHandlerMiddleware()(handler)    // innermost
+	handler = middleware.ValidationMiddleware()(handler)
+	handler = middleware.LoggingMiddleware()(handler)         // outermost
+
 	// Create HTTP server
 	httpServer := &http.Server{
 		Addr:         *httpAddr,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,

@@ -4,6 +4,8 @@ package programs
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -196,6 +198,70 @@ func (p *BaseProgram) AddLink(l link.Link) {
 	defer p.mu.Unlock()
 	p.links = append(p.links, l)
 	p.attached = true
+}
+
+// TCClassifier loads the connection_interface TC program and exposes its maps.
+type TCClassifier struct {
+	collection *ebpf.Collection
+	maps       map[string]*ebpf.Map
+}
+
+// LoadTCClassifier loads the TC ingress classifier object and returns map handles.
+// The caller is responsible for calling Close() when finished.
+func LoadTCClassifier(ctx context.Context) (*TCClassifier, error) {
+	_ = ctx
+	objPath := filepath.Join("bpf", "connection_interface.o")
+	if _, err := os.Stat(objPath); err != nil {
+		return nil, fmt.Errorf("tc classifier BPF object missing (%s): %w", objPath, err)
+	}
+
+	spec, err := ebpf.LoadCollectionSpec(objPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load tc classifier spec: %w", err)
+	}
+
+	collection, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load tc classifier collection: %w", err)
+	}
+
+	flowMap, ok := collection.Maps["flow_to_interface"]
+	if !ok {
+		collection.Close()
+		return nil, fmt.Errorf("tc classifier map flow_to_interface not found")
+	}
+
+	maps := map[string]*ebpf.Map{
+		"flow_to_interface": flowMap,
+	}
+
+	if statsMap, ok := collection.Maps["tc_stats"]; ok {
+		maps["tc_stats"] = statsMap
+	}
+
+	logger.Debugf("Loaded TC classifier BPF collection from %s", objPath)
+
+	return &TCClassifier{
+		collection: collection,
+		maps:       maps,
+	}, nil
+}
+
+// Maps returns a copy of the TC classifier maps for downstream consumers.
+func (tc *TCClassifier) Maps() map[string]interface{} {
+	result := make(map[string]interface{}, len(tc.maps))
+	for k, v := range tc.maps {
+		result[k] = v
+	}
+	return result
+}
+
+// Close releases the underlying eBPF collection.
+func (tc *TCClassifier) Close() error {
+	if tc.collection == nil {
+		return nil
+	}
+	return tc.collection.Close()
 }
 
 // StartRingBufferReader starts reading from a ring buffer map and parsing events.

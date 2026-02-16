@@ -54,6 +54,17 @@ func Infof(format string, v ...interface{}) {
 	defaultLogger.logger.Printf(format, v...)
 }
 
+// Warn logs a warning message
+func Warn(v ...interface{}) {
+	args := append([]interface{}{"[WARN] "}, v...)
+	defaultLogger.logger.Print(args...)
+}
+
+// Warnf logs a formatted warning message
+func Warnf(format string, v ...interface{}) {
+	defaultLogger.logger.Printf("[WARN] "+format, v...)
+}
+
 // Debug logs a debug message (only when debug level is enabled)
 func Debug(v ...interface{}) {
 	if defaultLogger.level >= DEBUG {
@@ -93,4 +104,18 @@ func Errorf(format string, v ...interface{}) {
 // IsDebugEnabled returns true if debug logging is enabled
 func IsDebugEnabled() bool {
 	return defaultLogger.level >= DEBUG
+}
+
+// GetDefaultLogger returns the default logger instance
+// Used for passing to components that need a logger
+func GetDefaultLogger() *Logger {
+	return defaultLogger
+}
+
+// Debugf logs a formatted debug message using the logger instance
+// Method version to support instances that hold a logger field
+func (l *Logger) Debugf(format string, v ...interface{}) {
+	if l.level >= DEBUG {
+		l.logger.Printf("[DEBUG] "+format, v...)
+	}
 }

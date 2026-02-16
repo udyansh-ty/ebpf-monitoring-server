@@ -4,6 +4,7 @@ go 1.19
 
 require (
 	github.com/cilium/ebpf v0.19.0
+	github.com/golang-jwt/jwt/v5 v5.2.0
 	github.com/jackc/pgx/v4 v4.18.3
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/swaggo/swag v1.16.6
