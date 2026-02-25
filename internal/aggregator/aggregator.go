@@ -577,8 +577,10 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage)
 		return fmt.Errorf("failed to parse event: %v", err)
 	}
 
+	// ANCHOR: Event Interface Assignment - Build fix - Feb 25, 2026
+	// Use core.Event type so enrichment can swap implementations.
 	// Create a simple event wrapper for storage
-	event := &SimpleEvent{
+	var event core.Event = &SimpleEvent{
 		data: eventMap,
 	}
 

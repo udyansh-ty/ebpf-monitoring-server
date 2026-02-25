@@ -322,7 +322,10 @@ func (tc *TCClassifier) Close() error {
 	if tc.collection == nil {
 		return nil
 	}
-	return tc.collection.Close()
+	// ANCHOR: TC Collection Close - Build fix - Feb 25, 2026
+	// Collection.Close() returns no error in this version; call and return nil.
+	tc.collection.Close()
+	return nil
 }
 
 // StartRingBufferReader starts reading from a ring buffer map and parsing events.

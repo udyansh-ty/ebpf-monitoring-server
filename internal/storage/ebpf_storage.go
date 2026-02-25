@@ -1,11 +1,12 @@
 // Package storage provides event storage implementations.
 package storage
 
+// ANCHOR: Storage Imports Cleanup - Build fix - Feb 25, 2026
+// Remove unused net import to satisfy the compiler.
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/jackc/pgx/v4/pgxpool"

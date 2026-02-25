@@ -316,7 +316,9 @@ func (s *PostgreSQLStorage) storeL7Event(ctx context.Context, event core.Event) 
 		observedAt = int64(oa)
 	}
 
-	_, err := s.pool.Exec(ctx, sql,
+	// ANCHOR: Exec Error Assignment - Build fix - Feb 25, 2026
+	// Reuse err instead of shadowing to satisfy compiler.
+	_, err = s.pool.Exec(ctx, sql,
 		event.ID(), flowID, flowKey, batchID, source, schemaVersion, event.Type(),
 		observedAt, srcIP, dstIP, srcPort, dstPort, protocol, ipVersion,
 		tlsSNI, tlsALPN, tlsVersion,

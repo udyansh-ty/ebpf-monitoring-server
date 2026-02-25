@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -26,7 +25,7 @@ import (
 type InterfaceResolver struct {
 	cache   map[int]string        // ifindex → interface_name mapping
 	mu      sync.RWMutex          // Protects cache map
-	log     logger.Logger          // Logger instance
+	log     *logger.Logger         // Logger instance
 	sysPath string                 // Path to /sys/class/net (configurable for testing)
 	quit    chan struct{}          // Signal to stop refresh goroutine
 	wg      sync.WaitGroup         // Wait for goroutine completion
@@ -46,7 +45,9 @@ type ResolverStats struct {
 
 // NewInterfaceResolver creates a new interface resolver.
 // It initially scans /sys/class/net/ to populate the cache.
-func NewInterfaceResolver(log logger.Logger) *InterfaceResolver {
+// ANCHOR: Logger Pointer Alignment - Build fix - Feb 25, 2026
+// Accept *logger.Logger to match GetDefaultLogger return type.
+func NewInterfaceResolver(log *logger.Logger) *InterfaceResolver {
 	resolver := &InterfaceResolver{
 		cache:   make(map[int]string),
 		log:     log,
@@ -59,7 +60,9 @@ func NewInterfaceResolver(log logger.Logger) *InterfaceResolver {
 
 	// Initial cache population
 	if err := resolver.refreshCacheInternal(); err != nil {
-		log.Warnf("Failed to initialize interface resolver cache: %v", err)
+		// ANCHOR: Logger Method Fix - Build fix - Feb 25, 2026
+		// Use package-level logger since Logger type lacks Warnf.
+		logger.Warnf("Failed to initialize interface resolver cache: %v", err)
 	}
 
 	return resolver
@@ -119,7 +122,9 @@ func (r *InterfaceResolver) GetInterfaceName(ctx context.Context, ifindex int) (
 		ifName := iface.Name()
 		idx, err := r.readIfindex(ifName)
 		if err != nil {
-			r.log.Debugf("Failed to read ifindex for %s: %v", ifName, err)
+			if r.log != nil {
+				r.log.Debugf("Failed to read ifindex for %s: %v", ifName, err)
+			}
 			continue
 		}
 
@@ -180,7 +185,9 @@ func (r *InterfaceResolver) refreshLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			if err := r.refreshCacheInternal(); err != nil {
-				r.log.Debugf("Cache refresh error: %v", err)
+				if r.log != nil {
+					r.log.Debugf("Cache refresh error: %v", err)
+				}
 				r.stats.mu.Lock()
 				r.stats.LastRefreshError = err.Error()
 				r.stats.mu.Unlock()
@@ -220,7 +227,9 @@ func (r *InterfaceResolver) refreshCacheInternal() error {
 
 		idx, err := r.readIfindex(ifName)
 		if err != nil {
-			r.log.Debugf("Failed to read ifindex for %s: %v", ifName, err)
+			if r.log != nil {
+				r.log.Debugf("Failed to read ifindex for %s: %v", ifName, err)
+			}
 			continue
 		}
 

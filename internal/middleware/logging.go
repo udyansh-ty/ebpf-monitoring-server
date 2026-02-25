@@ -1,7 +1,8 @@
 package middleware
 
+// ANCHOR: Logging Imports Cleanup - Build fix - Feb 25, 2026
+// Remove unused fmt import to satisfy the compiler.
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"time"
