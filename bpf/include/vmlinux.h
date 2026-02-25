@@ -20,6 +20,17 @@ typedef signed short s16;
 typedef signed int s32;
 typedef signed long long s64;
 
+// ANCHOR: __u* typedefs for BPF headers - Build fix - Feb 25, 2026
+// Provide __u* aliases expected by system BPF headers when using minimal vmlinux.h.
+typedef u8 __u8;
+typedef u16 __u16;
+typedef u32 __u32;
+typedef u64 __u64;
+typedef s8 __s8;
+typedef s16 __s16;
+typedef s32 __s32;
+typedef s64 __s64;
+
 /* Process/task related structures */
 struct trace_event_raw_sys_enter {
     u16 common_type;
