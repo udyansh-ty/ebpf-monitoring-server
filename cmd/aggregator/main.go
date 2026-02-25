@@ -92,9 +92,12 @@ func main() {
 		logger.Info("⚠️  EventEnricher disabled (--disable-enricher flag set)")
 	}
 
+	// ANCHOR: Pass Configured Storage - Bug: storage ignored - Feb 25, 2026
+	// Ensure the aggregator uses PostgreSQL storage when DB_URL is provided.
 	// Create aggregator
 	agg, err := aggregator.New(&aggregator.Config{
 		HTTPAddr: *httpAddr,
+		Storage:  pgStorage,
 		Enricher: enricher, // Pass enricher to aggregator for event pipeline integration (Phase 1B)
 	})
 	if err != nil {

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"mime"
 	"net/http"
 )
 
@@ -9,18 +10,26 @@ import (
 func ValidationMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// ANCHOR: JSON Content-Type Parsing - Bug: charset rejected - Feb 25, 2026
+			// Accept application/json with optional parameters (e.g., charset) and reject others.
 			// Validate Content-Type for POST/PUT requests
 			if r.Method == http.MethodPost || r.Method == http.MethodPut {
 				contentType := r.Header.Get("Content-Type")
-				if contentType != "" && contentType != "application/json" {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusUnsupportedMediaType)
-					json.NewEncoder(w).Encode(ErrorResponse{
-						Error:   "Unsupported Media Type",
-						Code:    http.StatusUnsupportedMediaType,
-						Message: "Content-Type must be application/json",
-					})
-					return
+				if contentType != "" {
+					mediaType, _, err := mime.ParseMediaType(contentType)
+					if err != nil {
+						mediaType = contentType
+					}
+					if mediaType != "application/json" {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusUnsupportedMediaType)
+						json.NewEncoder(w).Encode(ErrorResponse{
+							Error:   "Unsupported Media Type",
+							Code:    http.StatusUnsupportedMediaType,
+							Message: "Content-Type must be application/json",
+						})
+						return
+					}
 				}
 			}
 

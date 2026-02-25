@@ -70,6 +70,13 @@ func HandleRefresh(tokenGen *auth.TokenGenerator) http.HandlerFunc {
 			return
 		}
 
+		// ANCHOR: Refresh Token Enforcement - Bug: access token accepted - Feb 25, 2026
+		// Only refresh tokens may be used to mint new access tokens.
+		if claims.TokenUse != auth.TokenUseRefresh {
+			http.Error(w, "invalid refresh token", http.StatusUnauthorized)
+			return
+		}
+
 		tokens, err := tokenGen.GenerateTokens(claims.UserID, claims.Username, claims.Roles)
 		if err != nil {
 			http.Error(w, "failed to generate tokens", http.StatusInternalServerError)

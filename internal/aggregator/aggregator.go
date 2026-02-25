@@ -116,8 +116,11 @@ type AggregatedSummaryResponse struct {
 
 // Config represents aggregator configuration.
 type Config struct {
-	HTTPAddr  string
-	Enricher  *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
+	HTTPAddr string
+	// ANCHOR: Aggregator Storage Injection - Bug: pgStorage unused - Feb 25, 2026
+	// Allow callers to supply a storage backend instead of always using memory.
+	Storage  core.EventSink
+	Enricher *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
 }
 
 // ProgramCache caches program information to avoid expensive queries
@@ -154,8 +157,12 @@ func New(config *Config) (*Aggregator, error) {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 
-	// Create in-memory storage for aggregated events
-	eventStorage := storage.NewMemoryStorage()
+	// ANCHOR: Aggregator Storage Injection - Bug: pgStorage unused - Feb 25, 2026
+	// Use configured storage when provided, default to in-memory storage otherwise.
+	eventStorage := config.Storage
+	if eventStorage == nil {
+		eventStorage = storage.NewMemoryStorage()
+	}
 
 	return &Aggregator{
 		config:  config,

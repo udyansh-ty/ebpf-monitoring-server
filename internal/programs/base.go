@@ -204,12 +204,63 @@ func (p *BaseProgram) AddLink(l link.Link) {
 type TCClassifier struct {
 	collection *ebpf.Collection
 	maps       map[string]*ebpf.Map
+	pinnedMaps []*ebpf.Map
 }
 
 // LoadTCClassifier loads the TC ingress classifier object and returns map handles.
 // The caller is responsible for calling Close() when finished.
 func LoadTCClassifier(ctx context.Context) (*TCClassifier, error) {
 	_ = ctx
+	// ANCHOR: Pinned TC Map Loading - Bug: enricher not wired to live maps - Feb 25, 2026
+	// Prefer pinned maps created by tc attach so lookups hit the live classifier data.
+	flowMapPin := os.Getenv("TC_FLOW_MAP_PIN")
+	if flowMapPin == "" {
+		flowMapPin = filepath.Join(string(os.PathSeparator), "sys", "fs", "bpf", "flow_to_interface")
+	}
+	statsMapPin := os.Getenv("TC_STATS_MAP_PIN")
+	if statsMapPin == "" {
+		statsMapPin = filepath.Join(string(os.PathSeparator), "sys", "fs", "bpf", "tc_stats")
+	}
+
+	if flowMapPin != "" {
+		if _, err := os.Stat(flowMapPin); err == nil {
+			flowMap, err := ebpf.LoadPinnedMap(flowMapPin, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load pinned flow map (%s): %w", flowMapPin, err)
+			}
+
+			maps := map[string]*ebpf.Map{
+				"flow_to_interface": flowMap,
+			}
+			pinnedMaps := []*ebpf.Map{flowMap}
+
+			if statsMapPin != "" {
+				if _, err := os.Stat(statsMapPin); err == nil {
+					statsMap, err := ebpf.LoadPinnedMap(statsMapPin, nil)
+					if err != nil {
+						flowMap.Close()
+						return nil, fmt.Errorf("failed to load pinned stats map (%s): %w", statsMapPin, err)
+					}
+					maps["tc_stats"] = statsMap
+					pinnedMaps = append(pinnedMaps, statsMap)
+				} else if !os.IsNotExist(err) {
+					flowMap.Close()
+					return nil, fmt.Errorf("failed to stat pinned stats map (%s): %w", statsMapPin, err)
+				}
+			}
+
+			logger.Debugf("Loaded pinned TC maps (flow=%s, stats=%s)", flowMapPin, statsMapPin)
+
+			return &TCClassifier{
+				collection: nil,
+				maps:       maps,
+				pinnedMaps: pinnedMaps,
+			}, nil
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to stat pinned flow map (%s): %w", flowMapPin, err)
+		}
+	}
+
 	objPath := filepath.Join("bpf", "connection_interface.o")
 	if _, err := os.Stat(objPath); err != nil {
 		return nil, fmt.Errorf("tc classifier BPF object missing (%s): %w", objPath, err)
@@ -244,6 +295,7 @@ func LoadTCClassifier(ctx context.Context) (*TCClassifier, error) {
 	return &TCClassifier{
 		collection: collection,
 		maps:       maps,
+		pinnedMaps: nil,
 	}, nil
 }
 
@@ -258,6 +310,15 @@ func (tc *TCClassifier) Maps() map[string]interface{} {
 
 // Close releases the underlying eBPF collection.
 func (tc *TCClassifier) Close() error {
+	// ANCHOR: Pinned Map Cleanup - Bug: leaked pinned maps - Feb 25, 2026
+	// Close pinned maps explicitly when not owned by a collection.
+	for _, m := range tc.pinnedMaps {
+		if m != nil {
+			if err := m.Close(); err != nil {
+				return err
+			}
+		}
+	}
 	if tc.collection == nil {
 		return nil
 	}

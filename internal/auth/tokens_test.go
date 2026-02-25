@@ -55,6 +55,35 @@ func TestValidateToken(t *testing.T) {
 	if claims.Username != "testuser" {
 		t.Errorf("Username mismatch: expected 'testuser', got '%s'", claims.Username)
 	}
+
+	// ANCHOR: Token Use Tests - Feb 25, 2026
+	// Ensure access tokens are tagged for validation.
+	if claims.TokenUse != TokenUseAccess {
+		t.Errorf("TokenUse mismatch: expected '%s', got '%s'", TokenUseAccess, claims.TokenUse)
+	}
+}
+
+// ANCHOR: Refresh Token Use Test - Feb 25, 2026
+// Validate refresh tokens include the correct token_use claim.
+func TestValidateRefreshToken(t *testing.T) {
+	config := &JWTConfig{
+		SigningKey:    "test-secret-key",
+		TokenExpiry:   1 * time.Hour,
+		RefreshExpiry: 24 * time.Hour,
+	}
+
+	tg := NewTokenGenerator(config)
+
+	tokens, _ := tg.GenerateTokens("user123", "testuser", []string{"user"})
+
+	claims, err := tg.ValidateToken(tokens.RefreshToken)
+	if err != nil {
+		t.Fatalf("ValidateToken failed for refresh: %v", err)
+	}
+
+	if claims.TokenUse != TokenUseRefresh {
+		t.Errorf("TokenUse mismatch: expected '%s', got '%s'", TokenUseRefresh, claims.TokenUse)
+	}
 }
 
 func TestValidateInvalidToken(t *testing.T) {
