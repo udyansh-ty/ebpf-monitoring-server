@@ -48,6 +48,9 @@ typedef __u32 __wsum;
 #define IPPROTO_UDP 17
 #define IPPROTO_ICMPV6 58
 
+// TC action codes (pkt_cls)
+#define TC_ACT_OK 0
+
 struct __sk_buff {
 	__u32 len;
 	__u32 pkt_type;
