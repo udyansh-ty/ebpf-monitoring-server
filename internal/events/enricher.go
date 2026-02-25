@@ -228,6 +228,14 @@ func (e *EventEnricher) getIPVersion(metadata map[string]interface{}) int {
 			return 6
 		}
 	}
+	// ANCHOR: IPv6 Detection Fallback - Bug: IPv6 path missed - Feb 25, 2026
+	// Infer IPv6 from IP string when ip_version is absent.
+	if v, ok := metadata["src_ip"].(string); ok && strings.Contains(v, ":") {
+		return 6
+	}
+	if v, ok := metadata["dst_ip"].(string); ok && strings.Contains(v, ":") {
+		return 6
+	}
 	return 4
 }
 
@@ -299,8 +307,10 @@ func (e *EventEnricher) hashFlowKeyV4(srcIP, dstIP string, srcPort, dstPort uint
 		return 0, fmt.Errorf("invalid destination IP: %s", dstIP)
 	}
 
-	srcIPu32 := binary.BigEndian.Uint32(srcIPParsed.To4())
-	dstIPu32 := binary.BigEndian.Uint32(dstIPParsed.To4())
+	// ANCHOR: Flow Hash Endianness - Bug: flow key mismatch - Feb 25, 2026
+	// Match kernel hashing which reads network-order values as little-endian u32.
+	srcIPu32 := binary.LittleEndian.Uint32(srcIPParsed.To4())
+	dstIPu32 := binary.LittleEndian.Uint32(dstIPParsed.To4())
 
 	const fnvOffset uint64 = 0xcbf29ce484222325
 	const fnvPrime uint64 = 0x100000001b3
@@ -347,9 +357,11 @@ func (e *EventEnricher) hashFlowKeyV6(srcIP, dstIP string, srcPort, dstPort uint
 
 	hash := fnvOffset
 
+	// ANCHOR: IPv6 Hash Endianness - Bug: flow key mismatch - Feb 25, 2026
+	// Use little-endian chunks to align with kernel u32 reads.
 	for i := 0; i < 4; i++ {
-		srcChunk := binary.BigEndian.Uint32(srcBytes[i*4 : i*4+4])
-		dstChunk := binary.BigEndian.Uint32(dstBytes[i*4 : i*4+4])
+		srcChunk := binary.LittleEndian.Uint32(srcBytes[i*4 : i*4+4])
+		dstChunk := binary.LittleEndian.Uint32(dstBytes[i*4 : i*4+4])
 
 		hash ^= uint64(srcChunk)
 		hash *= fnvPrime
@@ -397,11 +409,8 @@ func (e *EventEnricher) getPortFromMetadata(metadata map[string]interface{}, fie
 }
 
 // lookupFlowInBPFMap queries the BPF map for interface index.
-// This would be implemented with CGO or libbpf bindings.
-// For now, returns 0 to indicate lookup not available.
-//
-// TODO: Implement with libbpf or cilium/ebpf package
-// This requires accessing the BPF maps from the TC classifier program
+// ANCHOR: TC Map Lookup - Bug: stale lookup comment - Feb 25, 2026
+// Use pinned map handles from the TC classifier when available; return 0 if absent.
 func (e *EventEnricher) lookupFlowInBPFMap(flowKey uint64) int {
 	lookup := e.getFlowMapLookup()
 	if lookup == nil {
