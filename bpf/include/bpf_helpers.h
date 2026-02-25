@@ -1,6 +1,12 @@
 #ifndef __BPF_HELPERS_H
 #define __BPF_HELPERS_H
 
+// ANCHOR: Compiler Attribute Helpers - Build fix - Feb 25, 2026
+// Provide __always_inline for local BPF programs.
+#ifndef __always_inline
+#define __always_inline __attribute__((always_inline)) inline
+#endif
+
 /* BPF helper functions - these are provided by the kernel */
 
 /* Map operations */
@@ -56,6 +62,12 @@ static int (*bpf_trace_printk)(const char *fmt, unsigned int fmt_size, ...) = (v
 #define BPF_MAP_TYPE_DEVMAP_HASH    25
 #define BPF_MAP_TYPE_STRUCT_OPS     26
 #define BPF_MAP_TYPE_RINGBUF        27
+
+// ANCHOR: Map Update Flags - Build fix - Feb 25, 2026
+// Provide minimal map update flags for local compilation.
+#ifndef BPF_ANY
+#define BPF_ANY 0
+#endif
 
 /* Section and map helper macros */
 #define SEC(name) __attribute__((section(name), used))

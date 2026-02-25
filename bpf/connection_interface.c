@@ -14,8 +14,10 @@
  */
 
 #include "vmlinux.h"
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
+// ANCHOR: Local BPF Headers - Build fix - Feb 25, 2026
+// Use repo-local helpers/endian macros to avoid missing kernel type defs.
+#include "bpf_helpers.h"
+#include "bpf_endian.h"
 
 /* Flow key is a hash of the 5-tuple (src_ip, dst_ip, src_port, dst_port, protocol)
  * This must match the calculation in userspace enricher for correlation.
