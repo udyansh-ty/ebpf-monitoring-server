@@ -7,11 +7,19 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// ANCHOR: Token Use Claim - Bug: refresh accepted as access - Feb 25, 2026
+// Add token_use to distinguish access vs refresh for validation.
+const (
+	TokenUseAccess  = "access"
+	TokenUseRefresh = "refresh"
+)
+
 // Claims represents JWT claims
 type Claims struct {
 	UserID   string   `json:"user_id"`
 	Username string   `json:"username"`
 	Roles    []string `json:"roles"`
+	TokenUse string   `json:"token_use"`
 	jwt.RegisteredClaims
 }
 
@@ -46,11 +54,14 @@ func (tg *TokenGenerator) GenerateTokens(userID, username string, roles []string
 	expiresAt := now.Add(tg.config.TokenExpiry)
 	refreshExpiresAt := now.Add(tg.config.RefreshExpiry)
 
+	// ANCHOR: Token Use Assignment - Bug: refresh accepted as access - Feb 25, 2026
+	// Tag access vs refresh tokens so handlers can enforce correct usage.
 	// Access token
 	accessClaims := Claims{
 		UserID:   userID,
 		Username: username,
 		Roles:    roles,
+		TokenUse: TokenUseAccess,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -69,6 +80,7 @@ func (tg *TokenGenerator) GenerateTokens(userID, username string, roles []string
 	refreshClaims := Claims{
 		UserID:   userID,
 		Username: username,
+		TokenUse: TokenUseRefresh,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(refreshExpiresAt),
 			IssuedAt:  jwt.NewNumericDate(now),
