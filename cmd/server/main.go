@@ -28,10 +28,16 @@ func main() {
 	)
 	flag.Parse()
 
-	// Validate JWT secret
-	if *jwtSecret == "" {
+	// ANCHOR: JWT Defaults + Secret Fallback - Bug: JWT expiry defaults ignored - Feb 25, 2026
+	// Use LoadJWTConfig() defaults and allow -jwt-secret override before fallback.
+	// Build JWT config with defaults
+	jwtConfig := auth.LoadJWTConfig()
+	if *jwtSecret != "" {
+		jwtConfig.SigningKey = *jwtSecret
+	}
+	if jwtConfig.SigningKey == "" {
 		fmt.Fprintf(os.Stderr, "WARNING: JWT_SECRET not set, generating random secret\n")
-		*jwtSecret = auth.GenerateSecret()
+		jwtConfig.SigningKey = auth.GenerateSecret()
 	}
 
 	// Check if debug logging is enabled
@@ -72,9 +78,7 @@ func main() {
 	}()
 
 	// Initialize token generator
-	tokenGen := auth.NewTokenGenerator(&auth.JWTConfig{
-		SigningKey: *jwtSecret,
-	})
+	tokenGen := auth.NewTokenGenerator(jwtConfig)
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
