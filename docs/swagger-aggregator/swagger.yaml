@@ -468,6 +468,297 @@ definitions:
         example: kprobe
         type: string
     type: object
+  l7.ErrorResponse:
+    properties:
+      error:
+        description: HTTP error name
+        example: Bad Request
+        type: string
+      message:
+        description: Error message
+        example: Invalid JSON format
+        type: string
+      timestamp:
+        description: Error timestamp
+        example: "2026-01-31T17:30:00Z"
+        type: string
+    type: object
+  l7.WebhookCertificate:
+    properties:
+      expiry_ts:
+        description: Expiration timestamp (Unix)
+        type: integer
+      issuer_cn:
+        description: Issuer Common Name
+        type: string
+      issuer_sha256:
+        description: Issuer certificate SHA256
+        type: string
+      leaf_sha256:
+        description: Leaf certificate SHA256
+        type: string
+      public_key_sha256:
+        description: Public key SHA256
+        type: string
+    type: object
+  l7.WebhookEvent:
+    properties:
+      certificate:
+        allOf:
+        - $ref: '#/definitions/l7.WebhookCertificate'
+        description: Certificate metadata
+      direction:
+        description: '"inbound" or "outbound"'
+        type: string
+      dst_ip:
+        description: Destination IP address
+        type: string
+      dst_port:
+        description: Destination port
+        type: integer
+      event_type:
+        description: Flow identification
+        type: string
+      fingerprints:
+        allOf:
+        - $ref: '#/definitions/l7.WebhookFingerprints'
+        description: TLS fingerprints
+      flow_id:
+        description: Human-readable flow identifier
+        type: string
+      flow_key:
+        description: Unique flow key for deduplication
+        type: string
+      flow_start_ts:
+        description: Flow start timestamp (ms)
+        type: integer
+      ip_version:
+        description: 4 or 6
+        type: integer
+      metadata:
+        additionalProperties: true
+        description: Backward compatibility (v1.0)
+        type: object
+      observed_at:
+        description: Observation timestamp (ms)
+        type: integer
+      protocol:
+        description: '"tcp", "udp", "quic"'
+        type: string
+      src_ip:
+        description: Network addresses
+        type: string
+      src_port:
+        description: Source port
+        type: integer
+      stats:
+        allOf:
+        - $ref: '#/definitions/l7.WebhookStats'
+        description: Statistics
+      tls:
+        allOf:
+        - $ref: '#/definitions/l7.WebhookTLS'
+        description: L7 security metadata
+      verdict:
+        allOf:
+        - $ref: '#/definitions/l7.WebhookVerdict'
+        description: Policy and verdict
+    type: object
+  l7.WebhookFingerprints:
+    properties:
+      ja3:
+        description: MD5-based fingerprint
+        type: string
+      ja3_features:
+        allOf:
+        - $ref: '#/definitions/l7.WebhookJA3Features'
+        description: JA3 component breakdown
+      ja4:
+        description: String-based fingerprint
+        type: string
+      ja4_plus:
+        description: SHA256-based fingerprint
+        type: string
+    type: object
+  l7.WebhookIngestionResponse:
+    properties:
+      events_failed:
+        description: Events that failed
+        example: 0
+        type: integer
+      events_processed:
+        description: Events successfully processed
+        example: 42
+        type: integer
+      message:
+        description: Status message
+        example: Processed 42/42 events from batch
+        type: string
+      schema_version:
+        description: Schema version received
+        example: "1.1"
+        type: string
+      success:
+        description: Success status
+        example: true
+        type: boolean
+      timestamp:
+        description: Response timestamp
+        example: "2026-01-31T17:30:00Z"
+        type: string
+      total_events:
+        description: Total events in payload
+        example: 42
+        type: integer
+    type: object
+  l7.WebhookJA3Features:
+    properties:
+      cipher_count:
+        description: Number of ciphers
+        type: integer
+      curve_count:
+        description: Number of curves
+        type: integer
+      extension_count:
+        description: Number of extensions
+        type: integer
+      point_formats:
+        description: EC point formats count
+        type: integer
+    type: object
+  l7.WebhookPayload:
+    properties:
+      batch_id:
+        description: Batch deduplication ID
+        type: string
+      events:
+        description: Batch of events
+        items:
+          $ref: '#/definitions/l7.WebhookEvent'
+        type: array
+      schema_version:
+        description: Batch metadata
+        type: string
+      sent_at:
+        description: RFC3339 timestamp
+        type: string
+      sequence:
+        description: Monotonic sequence number
+        type: integer
+      source:
+        description: Sensor identifier
+        type: string
+      source_instance:
+        description: Instance identifier
+        type: string
+    type: object
+  l7.WebhookQUIC:
+    properties:
+      dcid:
+        description: Destination Connection ID
+        type: string
+    type: object
+  l7.WebhookStats:
+    properties:
+      bytes:
+        description: Total bytes transferred
+        type: integer
+      duration_ms:
+        description: Flow duration in milliseconds
+        type: integer
+      extraction_latency_ms:
+        description: Data extraction latency
+        type: number
+      ingest_latency_ms:
+        description: Ingestion latency
+        type: number
+      packets:
+        description: Total packets
+        type: integer
+      sensor_latency_ms:
+        description: Sensor processing latency
+        type: number
+    type: object
+  l7.WebhookStatsResponse:
+    properties:
+      average_payload_size:
+        description: Average payload size (bytes)
+        example: 28000
+        type: integer
+      duplicate_events:
+        description: Duplicate events filtered
+        example: 0
+        type: integer
+      event_success_rate:
+        description: Success rate (%)
+        example: 99.67
+        type: number
+      failed_events:
+        description: Failed events
+        example: 150
+        type: integer
+      failed_payloads:
+        description: Failed payloads
+        example: 5
+        type: integer
+      payload_success_rate:
+        description: Success rate (%)
+        example: 99.67
+        type: number
+      query_time:
+        description: Query timestamp
+        example: "2026-01-31T17:30:00Z"
+        type: string
+      total_events:
+        description: Total events processed
+        example: 45000
+        type: integer
+      total_payloads:
+        description: Total payloads received
+        example: 1500
+        type: integer
+      tracked_batches:
+        description: Batches in dedup cache
+        example: 500
+        type: integer
+    type: object
+  l7.WebhookTLS:
+    properties:
+      alpn:
+        description: Application-Layer Protocol Negotiation
+        type: string
+      quic:
+        allOf:
+        - $ref: '#/definitions/l7.WebhookQUIC'
+        description: QUIC-specific information
+      sni:
+        description: Server Name Indication
+        type: string
+      version:
+        description: TLS version (e.g., "771" for TLS 1.2)
+        type: string
+    type: object
+  l7.WebhookVerdict:
+    properties:
+      action:
+        description: '"allow", "deny", "log"'
+        type: string
+      cert_mismatch_action:
+        description: Action taken on mismatch
+        type: string
+      cert_mismatch_reason:
+        description: Reason for mismatch
+        type: string
+      cert_validation_level:
+        description: '"standard", "strict", "none"'
+        type: string
+      priority:
+        description: Rule priority
+        type: integer
+      rule_id:
+        description: Policy rule identifier
+        type: string
+    type: object
 host: localhost:8081
 info:
   contact:
@@ -670,6 +961,55 @@ paths:
       summary: Ingest events from agents
       tags:
       - events
+  /api/l7/webhook:
+    post:
+      consumes:
+      - application/json
+      description: Ingests L7 telemetry (SSL/TLS, HTTP, DNS) from external sensors
+      parameters:
+      - description: Webhook payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/l7.WebhookPayload'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/l7.WebhookIngestionResponse'
+        "400":
+          description: Invalid payload
+          schema:
+            $ref: '#/definitions/l7.ErrorResponse'
+        "409":
+          description: Duplicate batch
+          schema:
+            $ref: '#/definitions/l7.ErrorResponse'
+        "500":
+          description: Storage error
+          schema:
+            $ref: '#/definitions/l7.ErrorResponse'
+      summary: Receive L7 webhook events
+      tags:
+      - l7
+  /api/l7/webhook/stats:
+    get:
+      consumes:
+      - application/json
+      description: Returns ingestion statistics for L7 webhooks
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/l7.WebhookStatsResponse'
+      summary: Get webhook receiver statistics
+      tags:
+      - l7
   /api/list-connections:
     get:
       consumes:

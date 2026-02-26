@@ -308,6 +308,81 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/l7/webhook": {
+            "post": {
+                "description": "Ingests L7 telemetry (SSL/TLS, HTTP, DNS) from external sensors",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "l7"
+                ],
+                "summary": "Receive L7 webhook events",
+                "parameters": [
+                    {
+                        "description": "Webhook payload",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/l7.WebhookPayload"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/l7.WebhookIngestionResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid payload",
+                        "schema": {
+                            "$ref": "#/definitions/l7.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Duplicate batch",
+                        "schema": {
+                            "$ref": "#/definitions/l7.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Storage error",
+                        "schema": {
+                            "$ref": "#/definitions/l7.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/l7/webhook/stats": {
+            "get": {
+                "description": "Returns ingestion statistics for L7 webhooks",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "l7"
+                ],
+                "summary": "Get webhook receiver statistics",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/l7.WebhookStatsResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/list-connections": {
             "get": {
                 "description": "Get recent connection events grouped by PID",
@@ -1271,6 +1346,418 @@ const docTemplate = `{
                     "description": "Program type",
                     "type": "string",
                     "example": "kprobe"
+                }
+            }
+        },
+        "l7.ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "description": "HTTP error name",
+                    "type": "string",
+                    "example": "Bad Request"
+                },
+                "message": {
+                    "description": "Error message",
+                    "type": "string",
+                    "example": "Invalid JSON format"
+                },
+                "timestamp": {
+                    "description": "Error timestamp",
+                    "type": "string",
+                    "example": "2026-01-31T17:30:00Z"
+                }
+            }
+        },
+        "l7.WebhookCertificate": {
+            "type": "object",
+            "properties": {
+                "expiry_ts": {
+                    "description": "Expiration timestamp (Unix)",
+                    "type": "integer"
+                },
+                "issuer_cn": {
+                    "description": "Issuer Common Name",
+                    "type": "string"
+                },
+                "issuer_sha256": {
+                    "description": "Issuer certificate SHA256",
+                    "type": "string"
+                },
+                "leaf_sha256": {
+                    "description": "Leaf certificate SHA256",
+                    "type": "string"
+                },
+                "public_key_sha256": {
+                    "description": "Public key SHA256",
+                    "type": "string"
+                }
+            }
+        },
+        "l7.WebhookEvent": {
+            "type": "object",
+            "properties": {
+                "certificate": {
+                    "description": "Certificate metadata",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/l7.WebhookCertificate"
+                        }
+                    ]
+                },
+                "direction": {
+                    "description": "\"inbound\" or \"outbound\"",
+                    "type": "string"
+                },
+                "dst_ip": {
+                    "description": "Destination IP address",
+                    "type": "string"
+                },
+                "dst_port": {
+                    "description": "Destination port",
+                    "type": "integer"
+                },
+                "event_type": {
+                    "description": "Flow identification",
+                    "type": "string"
+                },
+                "fingerprints": {
+                    "description": "TLS fingerprints",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/l7.WebhookFingerprints"
+                        }
+                    ]
+                },
+                "flow_id": {
+                    "description": "Human-readable flow identifier",
+                    "type": "string"
+                },
+                "flow_key": {
+                    "description": "Unique flow key for deduplication",
+                    "type": "string"
+                },
+                "flow_start_ts": {
+                    "description": "Flow start timestamp (ms)",
+                    "type": "integer"
+                },
+                "ip_version": {
+                    "description": "4 or 6",
+                    "type": "integer"
+                },
+                "metadata": {
+                    "description": "Backward compatibility (v1.0)",
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "observed_at": {
+                    "description": "Observation timestamp (ms)",
+                    "type": "integer"
+                },
+                "protocol": {
+                    "description": "\"tcp\", \"udp\", \"quic\"",
+                    "type": "string"
+                },
+                "src_ip": {
+                    "description": "Network addresses",
+                    "type": "string"
+                },
+                "src_port": {
+                    "description": "Source port",
+                    "type": "integer"
+                },
+                "stats": {
+                    "description": "Statistics",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/l7.WebhookStats"
+                        }
+                    ]
+                },
+                "tls": {
+                    "description": "L7 security metadata",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/l7.WebhookTLS"
+                        }
+                    ]
+                },
+                "verdict": {
+                    "description": "Policy and verdict",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/l7.WebhookVerdict"
+                        }
+                    ]
+                }
+            }
+        },
+        "l7.WebhookFingerprints": {
+            "type": "object",
+            "properties": {
+                "ja3": {
+                    "description": "MD5-based fingerprint",
+                    "type": "string"
+                },
+                "ja3_features": {
+                    "description": "JA3 component breakdown",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/l7.WebhookJA3Features"
+                        }
+                    ]
+                },
+                "ja4": {
+                    "description": "String-based fingerprint",
+                    "type": "string"
+                },
+                "ja4_plus": {
+                    "description": "SHA256-based fingerprint",
+                    "type": "string"
+                }
+            }
+        },
+        "l7.WebhookIngestionResponse": {
+            "type": "object",
+            "properties": {
+                "events_failed": {
+                    "description": "Events that failed",
+                    "type": "integer",
+                    "example": 0
+                },
+                "events_processed": {
+                    "description": "Events successfully processed",
+                    "type": "integer",
+                    "example": 42
+                },
+                "message": {
+                    "description": "Status message",
+                    "type": "string",
+                    "example": "Processed 42/42 events from batch"
+                },
+                "schema_version": {
+                    "description": "Schema version received",
+                    "type": "string",
+                    "example": "1.1"
+                },
+                "success": {
+                    "description": "Success status",
+                    "type": "boolean",
+                    "example": true
+                },
+                "timestamp": {
+                    "description": "Response timestamp",
+                    "type": "string",
+                    "example": "2026-01-31T17:30:00Z"
+                },
+                "total_events": {
+                    "description": "Total events in payload",
+                    "type": "integer",
+                    "example": 42
+                }
+            }
+        },
+        "l7.WebhookJA3Features": {
+            "type": "object",
+            "properties": {
+                "cipher_count": {
+                    "description": "Number of ciphers",
+                    "type": "integer"
+                },
+                "curve_count": {
+                    "description": "Number of curves",
+                    "type": "integer"
+                },
+                "extension_count": {
+                    "description": "Number of extensions",
+                    "type": "integer"
+                },
+                "point_formats": {
+                    "description": "EC point formats count",
+                    "type": "integer"
+                }
+            }
+        },
+        "l7.WebhookPayload": {
+            "type": "object",
+            "properties": {
+                "batch_id": {
+                    "description": "Batch deduplication ID",
+                    "type": "string"
+                },
+                "events": {
+                    "description": "Batch of events",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/l7.WebhookEvent"
+                    }
+                },
+                "schema_version": {
+                    "description": "Batch metadata",
+                    "type": "string"
+                },
+                "sent_at": {
+                    "description": "RFC3339 timestamp",
+                    "type": "string"
+                },
+                "sequence": {
+                    "description": "Monotonic sequence number",
+                    "type": "integer"
+                },
+                "source": {
+                    "description": "Sensor identifier",
+                    "type": "string"
+                },
+                "source_instance": {
+                    "description": "Instance identifier",
+                    "type": "string"
+                }
+            }
+        },
+        "l7.WebhookQUIC": {
+            "type": "object",
+            "properties": {
+                "dcid": {
+                    "description": "Destination Connection ID",
+                    "type": "string"
+                }
+            }
+        },
+        "l7.WebhookStats": {
+            "type": "object",
+            "properties": {
+                "bytes": {
+                    "description": "Total bytes transferred",
+                    "type": "integer"
+                },
+                "duration_ms": {
+                    "description": "Flow duration in milliseconds",
+                    "type": "integer"
+                },
+                "extraction_latency_ms": {
+                    "description": "Data extraction latency",
+                    "type": "number"
+                },
+                "ingest_latency_ms": {
+                    "description": "Ingestion latency",
+                    "type": "number"
+                },
+                "packets": {
+                    "description": "Total packets",
+                    "type": "integer"
+                },
+                "sensor_latency_ms": {
+                    "description": "Sensor processing latency",
+                    "type": "number"
+                }
+            }
+        },
+        "l7.WebhookStatsResponse": {
+            "type": "object",
+            "properties": {
+                "average_payload_size": {
+                    "description": "Average payload size (bytes)",
+                    "type": "integer",
+                    "example": 28000
+                },
+                "duplicate_events": {
+                    "description": "Duplicate events filtered",
+                    "type": "integer",
+                    "example": 0
+                },
+                "event_success_rate": {
+                    "description": "Success rate (%)",
+                    "type": "number",
+                    "example": 99.67
+                },
+                "failed_events": {
+                    "description": "Failed events",
+                    "type": "integer",
+                    "example": 150
+                },
+                "failed_payloads": {
+                    "description": "Failed payloads",
+                    "type": "integer",
+                    "example": 5
+                },
+                "payload_success_rate": {
+                    "description": "Success rate (%)",
+                    "type": "number",
+                    "example": 99.67
+                },
+                "query_time": {
+                    "description": "Query timestamp",
+                    "type": "string",
+                    "example": "2026-01-31T17:30:00Z"
+                },
+                "total_events": {
+                    "description": "Total events processed",
+                    "type": "integer",
+                    "example": 45000
+                },
+                "total_payloads": {
+                    "description": "Total payloads received",
+                    "type": "integer",
+                    "example": 1500
+                },
+                "tracked_batches": {
+                    "description": "Batches in dedup cache",
+                    "type": "integer",
+                    "example": 500
+                }
+            }
+        },
+        "l7.WebhookTLS": {
+            "type": "object",
+            "properties": {
+                "alpn": {
+                    "description": "Application-Layer Protocol Negotiation",
+                    "type": "string"
+                },
+                "quic": {
+                    "description": "QUIC-specific information",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/l7.WebhookQUIC"
+                        }
+                    ]
+                },
+                "sni": {
+                    "description": "Server Name Indication",
+                    "type": "string"
+                },
+                "version": {
+                    "description": "TLS version (e.g., \"771\" for TLS 1.2)",
+                    "type": "string"
+                }
+            }
+        },
+        "l7.WebhookVerdict": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "description": "\"allow\", \"deny\", \"log\"",
+                    "type": "string"
+                },
+                "cert_mismatch_action": {
+                    "description": "Action taken on mismatch",
+                    "type": "string"
+                },
+                "cert_mismatch_reason": {
+                    "description": "Reason for mismatch",
+                    "type": "string"
+                },
+                "cert_validation_level": {
+                    "description": "\"standard\", \"strict\", \"none\"",
+                    "type": "string"
+                },
+                "priority": {
+                    "description": "Rule priority",
+                    "type": "integer"
+                },
+                "rule_id": {
+                    "description": "Policy rule identifier",
+                    "type": "string"
                 }
             }
         }
