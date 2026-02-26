@@ -578,7 +578,7 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage)
 	}
 
 	// Create a simple event wrapper for storage
-	event := &SimpleEvent{
+	var event core.Event = &SimpleEvent{
 		data: eventMap,
 	}
 

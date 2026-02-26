@@ -142,9 +142,9 @@ func main() {
 
 	// Create middleware stack
 	handler := http.Handler(mux)
-	handler = middleware.ErrorHandlerMiddleware()(handler)    // innermost
+	handler = middleware.ErrorHandlerMiddleware()(handler) // innermost
 	handler = middleware.ValidationMiddleware()(handler)
-	handler = middleware.LoggingMiddleware()(handler)         // outermost
+	handler = middleware.LoggingMiddleware()(handler) // outermost
 
 	// Create HTTP server
 	httpServer := &http.Server{

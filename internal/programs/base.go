@@ -322,7 +322,8 @@ func (tc *TCClassifier) Close() error {
 	if tc.collection == nil {
 		return nil
 	}
-	return tc.collection.Close()
+	tc.collection.Close()
+	return nil
 }
 
 // StartRingBufferReader starts reading from a ring buffer map and parsing events.

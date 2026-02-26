@@ -37,6 +37,18 @@ type ConnectionStats struct {
 	UniqueDestIPs    int
 }
 
+// DestStat contains destination IP and connection count.
+type DestStat struct {
+	IP              string
+	ConnectionCount int
+}
+
+// TimeStat contains timestamp and event count.
+type TimeStat struct {
+	Timestamp time.Time
+	Count     int
+}
+
 // GetConnectionStats returns aggregated statistics for connection events.
 func (q *EBPFQueries) GetConnectionStats(ctx context.Context, since time.Time) (*ConnectionStats, error) {
 	sql := `
@@ -362,10 +374,7 @@ func (q *EBPFQueries) ListPrograms(ctx context.Context) ([]string, error) {
 }
 
 // TopDestinations returns the top destination IPs by connection count.
-func (q *EBPFQueries) TopDestinations(ctx context.Context, limit int) ([]struct {
-	IP              string
-	ConnectionCount int
-}, error) {
+func (q *EBPFQueries) TopDestinations(ctx context.Context, limit int) ([]DestStat, error) {
 	sql := `
 		SELECT
 			dst_ip::text as ip,
@@ -385,12 +394,7 @@ func (q *EBPFQueries) TopDestinations(ctx context.Context, limit int) ([]struct 
 	}
 	defer rows.Close()
 
-	type destStat struct {
-		IP              string
-		ConnectionCount int
-	}
-
-	var results []destStat
+	var results []DestStat
 	for rows.Next() {
 		var ip string
 		var count int
@@ -398,7 +402,7 @@ func (q *EBPFQueries) TopDestinations(ctx context.Context, limit int) ([]struct 
 			logger.Errorf("Failed to scan destination: %v", err)
 			continue
 		}
-		results = append(results, destStat{IP: ip, ConnectionCount: count})
+		results = append(results, DestStat{IP: ip, ConnectionCount: count})
 	}
 
 	if err = rows.Err(); err != nil {
@@ -410,10 +414,7 @@ func (q *EBPFQueries) TopDestinations(ctx context.Context, limit int) ([]struct 
 }
 
 // ConnectionTimeSeries returns connection count over time (1-minute buckets).
-func (q *EBPFQueries) ConnectionTimeSeries(ctx context.Context, since time.Time, until time.Time) ([]struct {
-	Timestamp time.Time
-	Count     int
-}, error) {
+func (q *EBPFQueries) ConnectionTimeSeries(ctx context.Context, since time.Time, until time.Time) ([]TimeStat, error) {
 	sql := `
 		SELECT
 			date_trunc('minute', observed_at) as minute,
@@ -433,12 +434,7 @@ func (q *EBPFQueries) ConnectionTimeSeries(ctx context.Context, since time.Time,
 	}
 	defer rows.Close()
 
-	type timeStat struct {
-		Timestamp time.Time
-		Count     int
-	}
-
-	var results []timeStat
+	var results []TimeStat
 	for rows.Next() {
 		var ts time.Time
 		var count int
@@ -446,7 +442,7 @@ func (q *EBPFQueries) ConnectionTimeSeries(ctx context.Context, since time.Time,
 			logger.Errorf("Failed to scan time series data: %v", err)
 			continue
 		}
-		results = append(results, timeStat{Timestamp: ts, Count: count})
+		results = append(results, TimeStat{Timestamp: ts, Count: count})
 	}
 
 	if err = rows.Err(); err != nil {

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -26,7 +25,7 @@ import (
 type InterfaceResolver struct {
 	cache   map[int]string        // ifindex → interface_name mapping
 	mu      sync.RWMutex          // Protects cache map
-	log     logger.Logger          // Logger instance
+	log     *logger.Logger         // Logger instance
 	sysPath string                 // Path to /sys/class/net (configurable for testing)
 	quit    chan struct{}          // Signal to stop refresh goroutine
 	wg      sync.WaitGroup         // Wait for goroutine completion
@@ -46,7 +45,7 @@ type ResolverStats struct {
 
 // NewInterfaceResolver creates a new interface resolver.
 // It initially scans /sys/class/net/ to populate the cache.
-func NewInterfaceResolver(log logger.Logger) *InterfaceResolver {
+func NewInterfaceResolver(log *logger.Logger) *InterfaceResolver {
 	resolver := &InterfaceResolver{
 		cache:   make(map[int]string),
 		log:     log,
@@ -59,7 +58,7 @@ func NewInterfaceResolver(log logger.Logger) *InterfaceResolver {
 
 	// Initial cache population
 	if err := resolver.refreshCacheInternal(); err != nil {
-		log.Warnf("Failed to initialize interface resolver cache: %v", err)
+		logger.Warnf("Failed to initialize interface resolver cache: %v", err)
 	}
 
 	return resolver
