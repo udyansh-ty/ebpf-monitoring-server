@@ -175,6 +175,9 @@ func (s *EBPFEventStorage) storeConnectionEvent(ctx context.Context, event core.
 		ON CONFLICT (id) DO NOTHING
 	`
 
+	// ANCHOR: Log eBPF connection event storage - March 21, 2026
+	logger.Debugf("[DB] Storing eBPF connection event id=%s", event.ID())
+
 	_, err := s.pool.Exec(ctx, sql,
 		event.ID(), event.Type(), programName, time.Now(), observedAt,
 		interfaceName, interfaceIndex,
@@ -186,12 +189,12 @@ func (s *EBPFEventStorage) storeConnectionEvent(ctx context.Context, event core.
 	)
 
 	if err != nil {
-		logger.Errorf("Failed to store connection event to eBPF table: %v", err)
+		logger.Errorf("[DB] storeConnectionEvent failed: %v", err)
 		return fmt.Errorf("failed to store connection event: %w", err)
 	}
 
-	logger.Debugf("💾 Stored eBPF connection event: pid=%d, src=%s:%v, dst=%s:%v",
-		event.PID(), srcIP, srcPort, dstIP, dstPort)
+	logger.Infof("[DB] Stored eBPF connection event id=%s pid=%d src=%s:%v dst=%s:%v",
+		event.ID(), event.PID(), srcIP, srcPort, dstIP, dstPort)
 
 	return nil
 }
@@ -294,6 +297,9 @@ func (s *EBPFEventStorage) storePacketDropEvent(ctx context.Context, event core.
 		ON CONFLICT (id) DO NOTHING
 	`
 
+	// ANCHOR: Log eBPF packet drop event storage - March 21, 2026
+	logger.Debugf("[DB] Storing eBPF packet_drop event id=%s", event.ID())
+
 	_, err := s.pool.Exec(ctx, sql,
 		event.ID(), event.Type(), programName, time.Now(), observedAt,
 		interfaceName, interfaceIndex,
@@ -305,12 +311,12 @@ func (s *EBPFEventStorage) storePacketDropEvent(ctx context.Context, event core.
 	)
 
 	if err != nil {
-		logger.Errorf("Failed to store packet drop event to eBPF table: %v", err)
+		logger.Errorf("[DB] storePacketDropEvent failed: %v", err)
 		return fmt.Errorf("failed to store packet drop event: %w", err)
 	}
 
-	logger.Debugf("💾 Stored eBPF packet drop event: pid=%d, reason=%s, count=%v",
-		event.PID(), dropReason, droppedCount)
+	logger.Infof("[DB] Stored eBPF packet_drop event id=%s pid=%d reason=%s count=%v",
+		event.ID(), event.PID(), dropReason, droppedCount)
 
 	return nil
 }
@@ -404,6 +410,9 @@ func (s *EBPFEventStorage) storeGenericEBPFEvent(ctx context.Context, event core
 		ON CONFLICT (id) DO NOTHING
 	`
 
+	// ANCHOR: Log eBPF generic event storage - March 21, 2026
+	logger.Debugf("[DB] Storing eBPF %s event id=%s", event.Type(), event.ID())
+
 	_, err := s.pool.Exec(ctx, sql,
 		event.ID(), event.Type(), programName, time.Now(), observedAt,
 		interfaceName, interfaceIndex,
@@ -414,12 +423,12 @@ func (s *EBPFEventStorage) storeGenericEBPFEvent(ctx context.Context, event core
 	)
 
 	if err != nil {
-		logger.Errorf("Failed to store generic eBPF event to table: %v", err)
+		logger.Errorf("[DB] storeGenericEBPFEvent failed type=%s: %v", event.Type(), err)
 		return fmt.Errorf("failed to store generic event: %w", err)
 	}
 
-	logger.Debugf("💾 Stored eBPF event: type=%s, pid=%d, program=%s",
-		event.Type(), event.PID(), programName)
+	logger.Infof("[DB] Stored eBPF %s event id=%s pid=%d program=%s",
+		event.Type(), event.ID(), event.PID(), programName)
 
 	return nil
 }

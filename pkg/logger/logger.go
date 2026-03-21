@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"io"
 	"log"
 	"os"
 )
@@ -118,4 +119,39 @@ func (l *Logger) Debugf(format string, v ...interface{}) {
 	if l.level >= DEBUG {
 		l.logger.Printf("[DEBUG] "+format, v...)
 	}
+}
+
+// ANCHOR: File logging support for aggregator debugging - March 21, 2026
+// WHY: Enable persistent log file at /var/log/ebpf-aggregator.log for debugging data insertions
+// WHAT: InitFileLogger opens file and redirects logging to both stdout and file via io.MultiWriter
+// HOW: Replace default logger's writer with MultiWriter(stdout, file) for dual output
+
+// InitFileLogger initializes file logging for the default logger
+// Logs will be written to both stdout and the specified file
+// Returns error if file cannot be opened (e.g., permissions), but doesn't fail startup
+func InitFileLogger(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	w := io.MultiWriter(os.Stdout, f)
+	defaultLogger.logger = log.New(w, "", log.LstdFlags)
+	return nil
+}
+
+// Method variants to support logger instances (for compatibility with storage packages)
+
+// Infof logs a formatted info message using the logger instance
+func (l *Logger) Infof(format string, v ...interface{}) {
+	l.logger.Printf(format, v...)
+}
+
+// Errorf logs a formatted error message using the logger instance
+func (l *Logger) Errorf(format string, v ...interface{}) {
+	l.logger.Printf("[ERROR] "+format, v...)
+}
+
+// Warnf logs a formatted warning message using the logger instance
+func (l *Logger) Warnf(format string, v ...interface{}) {
+	l.logger.Printf("[WARN] "+format, v...)
 }

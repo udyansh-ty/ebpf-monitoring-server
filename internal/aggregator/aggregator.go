@@ -633,6 +633,7 @@ func (a *Aggregator) cleanupRoutine(ctx context.Context) {
 }
 
 func (a *Aggregator) flushMetaRollups(ctx context.Context, nowEpoch int64) {
+	// ANCHOR: Log flush operations to file - March 21, 2026
 	writer, ok := a.storage.(metaWindowBatchWriter)
 	if !ok {
 		return
@@ -643,13 +644,15 @@ func (a *Aggregator) flushMetaRollups(ctx context.Context, nowEpoch int64) {
 		return
 	}
 
+	logger.Infof("[FLUSH] Flushing %d meta-window rollup entries to postgres (epoch=%d)", len(rows), nowEpoch)
+
 	if err := writer.UpsertMetaWindowRows(ctx, rows); err != nil {
-		logger.Errorf("Failed to flush metadata rollups (%d rows): %v", len(rows), err)
+		logger.Errorf("[FLUSH] Meta-window flush failed: %v", err)
 		a.mergeMetaRollupRows(rows)
 		return
 	}
 
-	logger.Debugf("Flushed %d metadata rollup rows to ebpf_meta_window", len(rows))
+	logger.Infof("[FLUSH] Meta-window flush complete")
 }
 
 func (a *Aggregator) runMetaWindowRetention(ctx context.Context) {
@@ -805,12 +808,24 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage,
 	eventType := event.Type()
 	if isMetaWindowOnlyEventType(eventType) {
 		if eventType == "connection" {
+			// ANCHOR: Log eBPF events being tracked for aggregation - March 21, 2026
+			metadata := event.Metadata()
+			srcIP := ""
+			dstIP := ""
+			if srcIPVal, ok := metadata["src_ip"].(string); ok {
+				srcIP = srcIPVal
+			}
+			if dstIPVal, ok := metadata["dst_ip"].(string); ok {
+				dstIP = dstIPVal
+			}
+			logger.Debugf("[INGEST] eBPF event type=%s src=%s dst=%s tracked in rollup", eventType, srcIP, dstIP)
 			a.trackMetaWindowRollup(event.Metadata())
 		}
 		return nil
 	}
 
 	// Non-eBPF event types (e.g. L7 webhook data) continue to use configured storage backend.
+	logger.Infof("[INGEST] L7 event type=%s stored directly", eventType)
 	if err := a.storage.Store(ctx, event); err != nil {
 		return err
 	}

@@ -56,6 +56,9 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 		return nil
 	}
 
+	// ANCHOR: Log metadata window upsert operations - March 21, 2026
+	logger.Infof("[DB] Upserting %d rows into ebpf_meta_window", len(rows))
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -99,18 +102,21 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 	for i := 0; i < len(rows); i++ {
 		if _, err := results.Exec(); err != nil {
 			_ = results.Close()
+			logger.Errorf("[DB] UpsertMetaWindowRows failed at row %d: %v", i, err)
 			return fmt.Errorf("meta window batch upsert failed at row %d: %w", i, err)
 		}
 	}
 	if err := results.Close(); err != nil {
+		logger.Errorf("[DB] Meta window batch close failed: %v", err)
 		return fmt.Errorf("meta window batch close failed: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		logger.Errorf("[DB] Failed to commit meta window upsert tx: %v", err)
 		return fmt.Errorf("failed to commit meta window upsert tx: %w", err)
 	}
 
-	logger.Debugf("💾 Upserted %d ebpf_meta_window aggregate rows", len(rows))
+	logger.Infof("[DB] ebpf_meta_window upsert committed (%d rows)", len(rows))
 	return nil
 }
 
@@ -119,6 +125,8 @@ func (s *PostgreSQLStorage) DeleteMetaWindowOlderThan(ctx context.Context, keepW
 	if keepWindowSeconds <= 0 {
 		return 0, nil
 	}
+
+	logger.Infof("[DB] Deleting ebpf_meta_window rows older than %d seconds", keepWindowSeconds)
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -130,10 +138,13 @@ func (s *PostgreSQLStorage) DeleteMetaWindowOlderThan(ctx context.Context, keepW
 
 	tag, err := s.pool.Exec(ctx, sql, keepWindowSeconds)
 	if err != nil {
+		logger.Errorf("[DB] DeleteMetaWindowOlderThan failed: %v", err)
 		return 0, fmt.Errorf("failed to apply ebpf_meta_window retention (window=%ds): %w", keepWindowSeconds, err)
 	}
 
-	return tag.RowsAffected(), nil
+	rowsDeleted := tag.RowsAffected()
+	logger.Infof("[DB] Deleted %d rows from ebpf_meta_window (window=%ds)", rowsDeleted, keepWindowSeconds)
+	return rowsDeleted, nil
 }
 
 // NewPostgreSQLStorage creates a new PostgreSQL-backed event storage.
@@ -421,6 +432,8 @@ func (s *PostgreSQLStorage) storeL7Event(ctx context.Context, event core.Event) 
 		observedAt = int64(oa)
 	}
 
+	logger.Debugf("[DB] Storing L7 event id=%s type=%s src=%s dst=%s", event.ID(), event.Type(), srcIP, dstIP)
+
 	_, err = s.pool.Exec(ctx, sql,
 		event.ID(), flowID, flowKey, batchID, source, schemaVersion, event.Type(),
 		observedAt, srcIP, dstIP, srcPort, dstPort, protocol, ipVersion,
@@ -434,11 +447,11 @@ func (s *PostgreSQLStorage) storeL7Event(ctx context.Context, event core.Event) 
 	)
 
 	if err != nil {
-		logger.Errorf("Failed to store event to PostgreSQL: %v", err)
+		logger.Errorf("[DB] storeL7Event failed id=%s: %v", event.ID(), err)
 		return fmt.Errorf("failed to store event: %w", err)
 	}
 
-	logger.Debugf("💾 Stored L7 event to PostgreSQL: type=%s, ndpi=%s/%s", event.Type(), ndpiProtocol, ndpiCategory)
+	logger.Infof("[DB] Stored L7 event id=%s type=%s src=%s->%s ndpi=%s/%s", event.ID(), event.Type(), srcIP, dstIP, ndpiProtocol, ndpiCategory)
 
 	return nil
 }

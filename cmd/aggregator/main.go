@@ -34,6 +34,16 @@ func main() {
 
 	logger.Info("Starting eBPF Event Aggregator...")
 
+	// ANCHOR: Initialize file logging for debugging - March 21, 2026
+	// WHY: All data insertions and operations should be logged to /var/log/ebpf-aggregator.log
+	// WHAT: Initialize dual logging to stdout and file
+	// HOW: Call InitFileLogger with graceful fallback to stdout-only if file not writable
+	if err := logger.InitFileLogger("/var/log/ebpf-aggregator.log"); err != nil {
+		logger.Warnf("Could not open log file /var/log/ebpf-aggregator.log: %v (logging to stdout only)", err)
+	} else {
+		logger.Info("Log file initialized: /var/log/ebpf-aggregator.log")
+	}
+
 	// ANCHOR: Optional PostgreSQL Storage for L7 and eBPF Events - Feb 3, 2026
 	// WHY: Enable persistent storage of L7 webhook events with NDPI enrichment AND eBPF kernel events with multi-NIC support
 	// WHAT: Check for DB_URL env var or -db-url flag, configure dual event storage backend
