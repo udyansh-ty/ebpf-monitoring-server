@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/pkg/logger"
@@ -29,6 +30,107 @@ type PostgreSQLStorage struct {
 	ebpfStorage *EBPFEventStorage
 	ebpfQueries *EBPFQueries
 	mu          sync.RWMutex
+}
+
+// EBPFMetaWindowRow represents one aggregated metadata row for ebpf_meta_window.
+type EBPFMetaWindowRow struct {
+	BucketEpoch    int64
+	SrcIP          string
+	DstIP          string
+	SNI            string
+	ActiveSeconds  int64
+	PacketsIn      int64
+	PacketsOut     int64
+	SessionCount   int64
+	FirstSeenEpoch int64
+	LastSeenEpoch  int64
+}
+
+// UpsertMetaWindowRows persists aggregated metadata rows into ebpf_meta_window.
+// Rows are applied in a single transaction and queued as a pgx batch.
+func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBPFMetaWindowRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sql := `
+		INSERT INTO ebpf_meta_window (
+			bucket_epoch, src_ip, dst_ip, sni,
+			active_seconds, packets_in, packets_out, session_count,
+			first_seen_epoch, last_seen_epoch
+		) VALUES (
+			$1, $2, $3, $4,
+			$5, $6, $7, $8,
+			$9, $10
+		)
+		ON CONFLICT (bucket_epoch, src_ip, dst_ip, sni) DO UPDATE SET
+			active_seconds = ebpf_meta_window.active_seconds + EXCLUDED.active_seconds,
+			packets_in = ebpf_meta_window.packets_in + EXCLUDED.packets_in,
+			packets_out = ebpf_meta_window.packets_out + EXCLUDED.packets_out,
+			session_count = ebpf_meta_window.session_count + EXCLUDED.session_count,
+			first_seen_epoch = LEAST(ebpf_meta_window.first_seen_epoch, EXCLUDED.first_seen_epoch),
+			last_seen_epoch = GREATEST(ebpf_meta_window.last_seen_epoch, EXCLUDED.last_seen_epoch)
+	`
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to begin meta window upsert tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	batch := &pgx.Batch{}
+	for _, row := range rows {
+		batch.Queue(sql,
+			row.BucketEpoch, row.SrcIP, row.DstIP, row.SNI,
+			row.ActiveSeconds, row.PacketsIn, row.PacketsOut, row.SessionCount,
+			row.FirstSeenEpoch, row.LastSeenEpoch,
+		)
+	}
+
+	results := tx.SendBatch(ctx, batch)
+	for i := 0; i < len(rows); i++ {
+		if _, err := results.Exec(); err != nil {
+			_ = results.Close()
+			return fmt.Errorf("meta window batch upsert failed at row %d: %w", i, err)
+		}
+	}
+	if err := results.Close(); err != nil {
+		return fmt.Errorf("meta window batch close failed: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit meta window upsert tx: %w", err)
+	}
+
+	logger.Debugf("💾 Upserted %d ebpf_meta_window aggregate rows", len(rows))
+	return nil
+}
+
+// DeleteMetaWindowOlderThan removes aggregate rows older than the provided window size.
+func (s *PostgreSQLStorage) DeleteMetaWindowOlderThan(ctx context.Context, keepWindowSeconds int64) (int64, error) {
+	if keepWindowSeconds <= 0 {
+		return 0, nil
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sql := `
+		DELETE FROM ebpf_meta_window
+		WHERE bucket_epoch < (EXTRACT(EPOCH FROM now())::bigint - $1)
+	`
+
+	tag, err := s.pool.Exec(ctx, sql, keepWindowSeconds)
+	if err != nil {
+		return 0, fmt.Errorf("failed to apply ebpf_meta_window retention (window=%ds): %w", keepWindowSeconds, err)
+	}
+
+	return tag.RowsAffected(), nil
 }
 
 // NewPostgreSQLStorage creates a new PostgreSQL-backed event storage.

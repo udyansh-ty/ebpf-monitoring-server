@@ -251,6 +251,71 @@ WHERE interface_name IS NOT NULL
 GROUP BY interface_name, event_type;
 `
 
+// ANCHOR: eBPF Metadata Window Aggregate Table - Phase 2
+// WHY: Persist only short-window aggregate metadata keyed by minute bucket + src/dst IP
+// WHAT: Lightweight aggregate table for bounded retention and lower write amplification
+// HOW: UNLOGGED table with compact counters and minimal indexing
+const createEBPFMetaWindowTable = `
+CREATE UNLOGGED TABLE IF NOT EXISTS ebpf_meta_window (
+  bucket_epoch      BIGINT NOT NULL,  -- minute bucket epoch, UTC, divisible by 60
+  src_ip            INET   NOT NULL,
+  dst_ip            INET   NOT NULL,
+  sni               TEXT   NOT NULL DEFAULT '',
+  active_seconds    BIGINT NOT NULL DEFAULT 0,
+  packets_in        BIGINT NOT NULL DEFAULT 0,
+  packets_out       BIGINT NOT NULL DEFAULT 0,
+  session_count     BIGINT NOT NULL DEFAULT 0,
+  first_seen_epoch  BIGINT NOT NULL,
+  last_seen_epoch   BIGINT NOT NULL,
+  PRIMARY KEY (bucket_epoch, src_ip, dst_ip, sni)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_time
+  ON ebpf_meta_window (bucket_epoch DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_dst_time
+  ON ebpf_meta_window (dst_ip, bucket_epoch DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_sni_time
+  ON ebpf_meta_window (sni, bucket_epoch DESC);
+`
+
+const ensureEBPFMetaWindowSNISchema = `
+DO $$
+DECLARE
+  pk_name TEXT;
+  has_target_pk BOOLEAN;
+BEGIN
+  ALTER TABLE ebpf_meta_window
+    ADD COLUMN IF NOT EXISTS sni TEXT NOT NULL DEFAULT '';
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    WHERE t.relname = 'ebpf_meta_window'
+      AND c.contype = 'p'
+      AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (bucket_epoch, src_ip, dst_ip, sni)'
+  ) INTO has_target_pk;
+
+  IF NOT has_target_pk THEN
+    SELECT c.conname INTO pk_name
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    WHERE t.relname = 'ebpf_meta_window' AND c.contype = 'p'
+    LIMIT 1;
+
+    IF pk_name IS NOT NULL THEN
+      EXECUTE format('ALTER TABLE ebpf_meta_window DROP CONSTRAINT %I', pk_name);
+    END IF;
+
+    ALTER TABLE ebpf_meta_window
+      ADD PRIMARY KEY (bucket_epoch, src_ip, dst_ip, sni);
+  END IF;
+END;
+$$;
+`
+
 // RunMigrations creates all required tables and indexes.
 func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 	_, err := conn.Exec(ctx, createL7EventsTable)
@@ -261,6 +326,16 @@ func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 	_, err = conn.Exec(ctx, createEBPFEventsTable)
 	if err != nil {
 		return fmt.Errorf("failed to create ebpf_events table: %w", err)
+	}
+
+	_, err = conn.Exec(ctx, createEBPFMetaWindowTable)
+	if err != nil {
+		return fmt.Errorf("failed to create ebpf_meta_window table: %w", err)
+	}
+
+	_, err = conn.Exec(ctx, ensureEBPFMetaWindowSNISchema)
+	if err != nil {
+		return fmt.Errorf("failed to migrate ebpf_meta_window sni schema: %w", err)
 	}
 
 	return nil
@@ -282,6 +357,11 @@ func DropAllTables(ctx context.Context, conn *pgx.Conn) error {
 	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS ebpf_events CASCADE;`)
 	if err != nil {
 		return fmt.Errorf("failed to drop ebpf_events table: %w", err)
+	}
+
+	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS ebpf_meta_window CASCADE;`)
+	if err != nil {
+		return fmt.Errorf("failed to drop ebpf_meta_window table: %w", err)
 	}
 
 	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS l7_events CASCADE;`)

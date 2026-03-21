@@ -16,8 +16,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,8 +122,10 @@ type Config struct {
 	HTTPAddr string
 	// ANCHOR: Aggregator Storage Injection - Bug: pgStorage unused - Feb 25, 2026
 	// Allow callers to supply a storage backend instead of always using memory.
-	Storage  core.EventSink
-	Enricher *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
+	Storage           core.EventSink
+	Enricher          *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
+	MetaWindow        time.Duration         // In-memory metadata rollup window
+	MetaFlushInterval time.Duration         // Periodic metadata rollup flush interval
 }
 
 // ProgramCache caches program information to avoid expensive queries
@@ -137,8 +142,39 @@ type Aggregator struct {
 	stats        *Stats
 	programCache *ProgramCache
 	enricher     *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
+	metaWindow   time.Duration
+	metaFlushInt time.Duration
+	metaRollups  map[metaRollupKey]*metaRollupAggregate
+	metaMu       sync.RWMutex
 	mu           sync.RWMutex
 	running      bool
+}
+
+type metaRollupKey struct {
+	BucketEpoch int64
+	SrcIP       string
+	DstIP       string
+	SNI         string
+}
+
+type metaRollupAggregate struct {
+	ActiveSeconds  int64
+	PacketsIn      int64
+	PacketsOut     int64
+	SessionCount   int64
+	FirstSeenEpoch int64
+	LastSeenEpoch  int64
+}
+
+const defaultMetaWindow = 10 * time.Minute
+const defaultMetaFlushInterval = 30 * time.Second
+
+type metaWindowBatchWriter interface {
+	UpsertMetaWindowRows(ctx context.Context, rows []storage.EBPFMetaWindowRow) error
+}
+
+type metaWindowRetentionStore interface {
+	DeleteMetaWindowOlderThan(ctx context.Context, keepWindowSeconds int64) (int64, error)
 }
 
 // Stats represents aggregation statistics.
@@ -163,6 +199,14 @@ func New(config *Config) (*Aggregator, error) {
 	if eventStorage == nil {
 		eventStorage = storage.NewMemoryStorage()
 	}
+	metaWindow := config.MetaWindow
+	if metaWindow <= 0 {
+		metaWindow = defaultMetaWindow
+	}
+	metaFlushInt := config.MetaFlushInterval
+	if metaFlushInt <= 0 {
+		metaFlushInt = defaultMetaFlushInterval
+	}
 
 	return &Aggregator{
 		config:  config,
@@ -174,6 +218,9 @@ func New(config *Config) (*Aggregator, error) {
 		},
 		programCache: &ProgramCache{},
 		enricher:     config.Enricher, // Use enricher from config (optional)
+		metaWindow:   metaWindow,
+		metaFlushInt: metaFlushInt,
+		metaRollups:  make(map[metaRollupKey]*metaRollupAggregate),
 	}, nil
 }
 
@@ -540,14 +587,30 @@ func (a *Aggregator) invalidateProgramCache() {
 
 // cleanupRoutine runs periodic cleanup of old events to prevent memory bloat
 func (a *Aggregator) cleanupRoutine(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute) // Cleanup every 5 minutes
+	ticker := time.NewTicker(5 * time.Minute) // Event cleanup every 5 minutes
+	pruneTicker := time.NewTicker(30 * time.Second)
+	flushTicker := time.NewTicker(a.metaFlushInt)
 	defer ticker.Stop()
+	defer pruneTicker.Stop()
+	defer flushTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			nowEpoch := time.Now().UTC().Unix()
+			a.flushMetaRollups(context.Background(), nowEpoch)
+			a.runMetaWindowRetention(context.Background())
 			logger.Debug("Cleanup routine stopping due to context cancellation")
 			return
+		case <-pruneTicker.C:
+			a.pruneMetaRollups(time.Now().UTC().Unix())
+		case <-flushTicker.C:
+			if !a.IsRunning() {
+				continue
+			}
+			nowEpoch := time.Now().UTC().Unix()
+			a.flushMetaRollups(ctx, nowEpoch)
+			a.runMetaWindowRetention(ctx)
 		case <-ticker.C:
 			if !a.IsRunning() {
 				continue
@@ -561,6 +624,134 @@ func (a *Aggregator) cleanupRoutine(ctx context.Context) {
 				memStorage.Cleanup(maxAge)
 				logger.Debugf("Cleanup completed")
 			}
+		}
+	}
+}
+
+func (a *Aggregator) flushMetaRollups(ctx context.Context, nowEpoch int64) {
+	writer, ok := a.storage.(metaWindowBatchWriter)
+	if !ok {
+		return
+	}
+
+	rows := a.drainMetaRollups(nowEpoch)
+	if len(rows) == 0 {
+		return
+	}
+
+	if err := writer.UpsertMetaWindowRows(ctx, rows); err != nil {
+		logger.Errorf("Failed to flush metadata rollups (%d rows): %v", len(rows), err)
+		a.mergeMetaRollupRows(rows)
+		return
+	}
+
+	logger.Debugf("Flushed %d metadata rollup rows to ebpf_meta_window", len(rows))
+}
+
+func (a *Aggregator) runMetaWindowRetention(ctx context.Context) {
+	retentionStore, ok := a.storage.(metaWindowRetentionStore)
+	if !ok {
+		return
+	}
+
+	keepWindowSeconds := int64(a.metaWindow / time.Second)
+	if keepWindowSeconds <= 0 {
+		keepWindowSeconds = int64(defaultMetaWindow / time.Second)
+	}
+
+	deletedRows, err := retentionStore.DeleteMetaWindowOlderThan(ctx, keepWindowSeconds)
+	if err != nil {
+		logger.Errorf("Failed metadata retention cleanup (window=%ds): %v", keepWindowSeconds, err)
+		return
+	}
+
+	if deletedRows > 0 {
+		logger.Debugf("Metadata retention removed %d row(s) older than %ds", deletedRows, keepWindowSeconds)
+	}
+}
+
+func (a *Aggregator) drainMetaRollups(nowEpoch int64) []storage.EBPFMetaWindowRow {
+	a.metaMu.Lock()
+	if len(a.metaRollups) == 0 {
+		a.metaMu.Unlock()
+		return nil
+	}
+
+	drained := a.metaRollups
+	a.metaRollups = make(map[metaRollupKey]*metaRollupAggregate, len(drained))
+	a.metaMu.Unlock()
+
+	rows := make([]storage.EBPFMetaWindowRow, 0, len(drained))
+	for key, entry := range drained {
+		if entry == nil {
+			continue
+		}
+
+		// Ignore obviously invalid rollups and keep map bounded by configured window.
+		if nowEpoch > 0 {
+			cutoffEpoch := nowEpoch - int64(a.metaWindow/time.Second)
+			if cutoffEpoch > 0 && entry.LastSeenEpoch < cutoffEpoch {
+				continue
+			}
+		}
+		if key.SrcIP == "" || key.DstIP == "" {
+			continue
+		}
+
+		rows = append(rows, storage.EBPFMetaWindowRow{
+			BucketEpoch:    key.BucketEpoch,
+			SrcIP:          key.SrcIP,
+			DstIP:          key.DstIP,
+			SNI:            key.SNI,
+			ActiveSeconds:  entry.ActiveSeconds,
+			PacketsIn:      entry.PacketsIn,
+			PacketsOut:     entry.PacketsOut,
+			SessionCount:   entry.SessionCount,
+			FirstSeenEpoch: entry.FirstSeenEpoch,
+			LastSeenEpoch:  entry.LastSeenEpoch,
+		})
+	}
+
+	return rows
+}
+
+func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
+	if len(rows) == 0 {
+		return
+	}
+
+	a.metaMu.Lock()
+	defer a.metaMu.Unlock()
+
+	for _, row := range rows {
+		key := metaRollupKey{
+			BucketEpoch: row.BucketEpoch,
+			SrcIP:       row.SrcIP,
+			DstIP:       row.DstIP,
+			SNI:         row.SNI,
+		}
+
+		if existing, ok := a.metaRollups[key]; ok {
+			existing.ActiveSeconds += row.ActiveSeconds
+			existing.PacketsIn += row.PacketsIn
+			existing.PacketsOut += row.PacketsOut
+			existing.SessionCount += row.SessionCount
+			if existing.FirstSeenEpoch == 0 || (row.FirstSeenEpoch > 0 && row.FirstSeenEpoch < existing.FirstSeenEpoch) {
+				existing.FirstSeenEpoch = row.FirstSeenEpoch
+			}
+			if row.LastSeenEpoch > existing.LastSeenEpoch {
+				existing.LastSeenEpoch = row.LastSeenEpoch
+			}
+			continue
+		}
+
+		a.metaRollups[key] = &metaRollupAggregate{
+			ActiveSeconds:  row.ActiveSeconds,
+			PacketsIn:      row.PacketsIn,
+			PacketsOut:     row.PacketsOut,
+			SessionCount:   row.SessionCount,
+			FirstSeenEpoch: row.FirstSeenEpoch,
+			LastSeenEpoch:  row.LastSeenEpoch,
 		}
 	}
 }
@@ -596,8 +787,418 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage)
 		}
 	}
 
-	// Store the event (enriched or original)
-	return a.storage.Store(ctx, event)
+	// Metadata-window mode: eBPF events are aggregated in-memory and flushed to ebpf_meta_window.
+	// Raw eBPF per-event storage (ebpf_events) is intentionally bypassed.
+	eventType := event.Type()
+	if isMetaWindowOnlyEventType(eventType) {
+		if eventType == "connection" {
+			a.trackMetaWindowRollup(event.Metadata())
+		}
+		return nil
+	}
+
+	// Non-eBPF event types (e.g. L7 webhook data) continue to use configured storage backend.
+	if err := a.storage.Store(ctx, event); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func isMetaWindowOnlyEventType(eventType string) bool {
+	switch eventType {
+	case "connection", "packet_drop", "packet", "process", "process_exec", "file_operation":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
+	if metadata == nil {
+		return
+	}
+
+	metadataMaps := collectMetadataMaps(metadata)
+	eventType := strings.ToLower(strings.TrimSpace(findFirstStringValue(metadataMaps, "type", "event_type")))
+	if eventType != "connection" {
+		return
+	}
+
+	srcIP := extractNormalizedIP(metadataMaps, "src_ip", "source_ip", "machine_ip", "client_ip")
+	dstIP := extractNormalizedIP(metadataMaps, "dst_ip", "dest_ip", "destination_ip", "server_ip", "remote_ip")
+	if srcIP == "" || dstIP == "" {
+		return
+	}
+	if net.ParseIP(srcIP) == nil || net.ParseIP(dstIP) == nil {
+		return
+	}
+
+	startNS, hasStart := getInt64FromMaps(metadataMaps, "session_start_ns", "start_ns", "first_seen_ns")
+	endNS, hasEnd := getInt64FromMaps(metadataMaps, "session_end_ns", "end_ns", "last_seen_ns")
+	if !hasStart {
+		startNS, hasStart = getInt64FromMaps(metadataMaps, "first_seen_epoch")
+	}
+	if !hasEnd {
+		endNS, hasEnd = getInt64FromMaps(metadataMaps, "last_seen_epoch")
+	}
+	if !hasEnd {
+		endNS, hasEnd = getInt64FromMaps(metadataMaps, "timestamp", "observed_at")
+	}
+	if !hasStart {
+		startNS, hasStart = getInt64FromMaps(metadataMaps, "timestamp", "observed_at")
+	}
+	if !hasStart && !hasEnd {
+		// Require at least one timing field to derive first/last seen.
+		return
+	}
+
+	firstSeenEpoch := epochSecondsFromAuto(startNS)
+	lastSeenEpoch := epochSecondsFromAuto(endNS)
+	if lastSeenEpoch == 0 {
+		if ts, ok := getInt64FromMaps(metadataMaps, "timestamp", "observed_at"); ok {
+			lastSeenEpoch = epochSecondsFromAuto(ts)
+		}
+	}
+	if firstSeenEpoch == 0 {
+		firstSeenEpoch = lastSeenEpoch
+	}
+	if firstSeenEpoch == 0 {
+		firstSeenEpoch = time.Now().UTC().Unix()
+	}
+	if lastSeenEpoch == 0 {
+		lastSeenEpoch = firstSeenEpoch
+	}
+	if lastSeenEpoch < firstSeenEpoch {
+		firstSeenEpoch, lastSeenEpoch = lastSeenEpoch, firstSeenEpoch
+	}
+
+	bucketEpoch := lastSeenEpoch - (lastSeenEpoch % 60)
+	if bucketEpoch < 0 {
+		bucketEpoch = 0
+	}
+
+	durationMS, _ := getInt64FromMaps(metadataMaps, "duration_ms")
+	activeSeconds := durationMS / 1000
+	if activeSeconds < 0 {
+		activeSeconds = 0
+	}
+	if activeSeconds == 0 && lastSeenEpoch > firstSeenEpoch {
+		activeSeconds = lastSeenEpoch - firstSeenEpoch
+	}
+
+	packetsIn, _ := getInt64FromMaps(metadataMaps, "packets_incoming", "packets_in", "incoming_packets", "rx_packets")
+	packetsOut, _ := getInt64FromMaps(metadataMaps, "packets_outgoing", "packets_out", "outgoing_packets", "tx_packets")
+	if packetsIn < 0 {
+		packetsIn = 0
+	}
+	if packetsOut < 0 {
+		packetsOut = 0
+	}
+	sni := extractSNI(metadataMaps)
+
+	key := metaRollupKey{
+		BucketEpoch: bucketEpoch,
+		SrcIP:       srcIP,
+		DstIP:       dstIP,
+		SNI:         sni,
+	}
+
+	a.metaMu.Lock()
+	defer a.metaMu.Unlock()
+
+	if entry, ok := a.metaRollups[key]; ok {
+		entry.ActiveSeconds += activeSeconds
+		entry.PacketsIn += packetsIn
+		entry.PacketsOut += packetsOut
+		entry.SessionCount++
+		if firstSeenEpoch < entry.FirstSeenEpoch {
+			entry.FirstSeenEpoch = firstSeenEpoch
+		}
+		if lastSeenEpoch > entry.LastSeenEpoch {
+			entry.LastSeenEpoch = lastSeenEpoch
+		}
+		return
+	}
+
+	a.metaRollups[key] = &metaRollupAggregate{
+		ActiveSeconds:  activeSeconds,
+		PacketsIn:      packetsIn,
+		PacketsOut:     packetsOut,
+		SessionCount:   1,
+		FirstSeenEpoch: firstSeenEpoch,
+		LastSeenEpoch:  lastSeenEpoch,
+	}
+}
+
+func collectMetadataMaps(metadata map[string]interface{}) []map[string]interface{} {
+	if metadata == nil {
+		return nil
+	}
+
+	maps := []map[string]interface{}{metadata}
+	for _, key := range []string{"metadata", "event", "data", "payload", "connection", "network"} {
+		nestedRaw, ok := metadata[key]
+		if !ok {
+			continue
+		}
+		nestedMap, ok := nestedRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		maps = append(maps, nestedMap)
+		if nestedMetaRaw, ok := nestedMap["metadata"]; ok {
+			if nestedMeta, ok := nestedMetaRaw.(map[string]interface{}); ok {
+				maps = append(maps, nestedMeta)
+			}
+		}
+	}
+
+	return maps
+}
+
+func findFirstStringValue(metadataMaps []map[string]interface{}, keys ...string) string {
+	for _, metadata := range metadataMaps {
+		if metadata == nil {
+			continue
+		}
+		for _, key := range keys {
+			if value := strings.TrimSpace(getStringValue(metadata, key)); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func extractNormalizedIP(metadataMaps []map[string]interface{}, keys ...string) string {
+	for _, metadata := range metadataMaps {
+		if metadata == nil {
+			continue
+		}
+		for _, key := range keys {
+			raw := strings.TrimSpace(getStringValue(metadata, key))
+			if raw == "" {
+				continue
+			}
+			if normalized := normalizeIP(raw); normalized != "" {
+				return normalized
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeIP(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+
+	if parsedURL, err := url.Parse(value); err == nil && parsedURL.Host != "" {
+		value = parsedURL.Host
+	}
+	value = strings.TrimSpace(value)
+	if idx := strings.IndexByte(value, '/'); idx >= 0 {
+		value = value[:idx]
+	}
+
+	if ip := net.ParseIP(strings.Trim(value, "[]")); ip != nil {
+		return ip.String()
+	}
+
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		host = strings.Trim(host, "[]")
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.String()
+		}
+	}
+
+	if strings.Count(value, ":") == 1 && strings.Contains(value, ".") {
+		if host, _, err := net.SplitHostPort(value); err == nil {
+			if ip := net.ParseIP(host); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+
+	return ""
+}
+
+func getInt64FromMaps(metadataMaps []map[string]interface{}, keys ...string) (int64, bool) {
+	for _, metadata := range metadataMaps {
+		if metadata == nil {
+			continue
+		}
+		if value, ok := getInt64Value(metadata, keys...); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func (a *Aggregator) pruneMetaRollups(nowEpoch int64) {
+	if nowEpoch <= 0 {
+		return
+	}
+	cutoffEpoch := nowEpoch - int64(a.metaWindow/time.Second)
+	if cutoffEpoch <= 0 {
+		return
+	}
+
+	a.metaMu.Lock()
+	defer a.metaMu.Unlock()
+	for key, entry := range a.metaRollups {
+		if entry.LastSeenEpoch < cutoffEpoch {
+			delete(a.metaRollups, key)
+		}
+	}
+}
+
+func getStringValue(metadata map[string]interface{}, key string) string {
+	raw, ok := metadata[key]
+	if !ok {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return strings.TrimSpace(v.String())
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
+func extractSNI(metadataMaps []map[string]interface{}) string {
+	for _, metadata := range metadataMaps {
+		if metadata == nil {
+			continue
+		}
+
+		for _, key := range []string{"sni", "server_name", "tls_sni", "hostname", "host", "domain"} {
+			if value := normalizeSNI(getStringValue(metadata, key)); value != "" {
+				return value
+			}
+		}
+
+		if tlsRaw, ok := metadata["tls"]; ok {
+			if tlsMap, ok := tlsRaw.(map[string]interface{}); ok {
+				for _, key := range []string{"sni", "server_name", "host"} {
+					if value := normalizeSNI(getStringValue(tlsMap, key)); value != "" {
+						return value
+					}
+				}
+			}
+		}
+
+		for _, key := range []string{"url", "request_url", "host_url"} {
+			if value := normalizeSNI(getStringValue(metadata, key)); value != "" {
+				return value
+			}
+		}
+	}
+
+	return ""
+}
+
+func normalizeSNI(raw string) string {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	if value == "" {
+		return ""
+	}
+
+	if parsedURL, err := url.Parse(value); err == nil && parsedURL.Host != "" {
+		value = parsedURL.Host
+	}
+
+	value = strings.TrimSpace(value)
+	if idx := strings.IndexByte(value, '/'); idx >= 0 {
+		value = value[:idx]
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+
+	value = strings.Trim(value, "[]")
+	value = strings.TrimSuffix(value, ".")
+	if value == "" {
+		return ""
+	}
+
+	if net.ParseIP(value) != nil {
+		return ""
+	}
+
+	return value
+}
+
+func getInt64Value(metadata map[string]interface{}, keys ...string) (int64, bool) {
+	for _, key := range keys {
+		raw, ok := metadata[key]
+		if !ok {
+			continue
+		}
+		switch v := raw.(type) {
+		case int:
+			return int64(v), true
+		case int8:
+			return int64(v), true
+		case int16:
+			return int64(v), true
+		case int32:
+			return int64(v), true
+		case int64:
+			return v, true
+		case uint:
+			return int64(v), true
+		case uint8:
+			return int64(v), true
+		case uint16:
+			return int64(v), true
+		case uint32:
+			return int64(v), true
+		case uint64:
+			return int64(v), true
+		case float32:
+			return int64(v), true
+		case float64:
+			return int64(v), true
+		case json.Number:
+			if parsed, err := v.Int64(); err == nil {
+				return parsed, true
+			}
+			if parsed, err := v.Float64(); err == nil {
+				return int64(parsed), true
+			}
+		case string:
+			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+				return parsed, true
+			}
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+				return int64(parsed), true
+			}
+		}
+	}
+	return 0, false
+}
+
+func epochSecondsFromAuto(v int64) int64 {
+	if v <= 0 {
+		return 0
+	}
+	switch {
+	case v >= 1_000_000_000_000_000: // nanoseconds
+		return v / int64(time.Second)
+	case v >= 1_000_000_000_000: // milliseconds
+		return v / int64(time.Millisecond)
+	default: // seconds
+		return v
+	}
 }
 
 // updateStats updates aggregation statistics.

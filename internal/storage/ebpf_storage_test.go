@@ -466,6 +466,7 @@ func setupTestPostgresPool(ctx context.Context, t *testing.T) (*pgxpool.Pool, fu
 		if conn != nil {
 			defer conn.Release()
 			conn.Conn().Exec(ctx, "DROP TABLE IF EXISTS ebpf_events CASCADE")
+			conn.Conn().Exec(ctx, "DROP TABLE IF EXISTS ebpf_meta_window CASCADE")
 			conn.Conn().Exec(ctx, "DROP TABLE IF EXISTS l7_events CASCADE")
 		}
 		pool.Close()
