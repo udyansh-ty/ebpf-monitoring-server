@@ -6,11 +6,46 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/internal/events"
 	"github.com/srodi/ebpf-server/internal/programs"
 	"github.com/srodi/ebpf-server/pkg/logger"
+)
+
+const (
+	afInet  = 2
+	afInet6 = 10
+)
+
+const (
+	sourceIPCacheTTL   = 30 * time.Second
+	rdnsLookupTimeout  = 200 * time.Millisecond
+	rdnsCacheTTL       = 10 * time.Minute
+	rdnsFailureCacheTT = 2 * time.Minute
+	rdnsCacheMaxKeys   = 4096
+)
+
+type sourceIPCacheEntry struct {
+	Value     string
+	UpdatedAt time.Time
+}
+
+type rdnsCacheEntry struct {
+	Value     string
+	UpdatedAt time.Time
+	TTL       time.Duration
+}
+
+var (
+	sourceIPCacheMu sync.RWMutex
+	sourceIPCache   = map[uint16]sourceIPCacheEntry{}
+
+	rdnsCacheMu sync.RWMutex
+	rdnsCache   = map[string]rdnsCacheEntry{}
 )
 
 const (
@@ -114,15 +149,27 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 	protocol := data[56]
 	sockType := data[57]
 
+	destinationIP := formatIP(family, destIPv4, destIPv6)
+	destination := formatDestination(family, destIPv4, destIPv6, destPort)
+	sourceIP := inferSourceIPForFamily(family, destinationIP)
+	serverName := inferServerNameFromIP(destinationIP)
+
 	// Build metadata with parsed fields and derived information
 	metadata := map[string]interface{}{
 		"return_code":      ret,
-		"destination_ip":   formatIP(family, destIPv4, destIPv6),
+		"destination_ip":   destinationIP,
+		"dest_ip":          destinationIP,
+		"dst_ip":           destinationIP,
 		"destination_port": destPort,
-		"destination":      formatDestination(family, destIPv4, destIPv6, destPort),
+		"dst_port":         destPort,
+		"destination":      destination,
 		"address_family":   family,
 		"protocol":         formatProtocol(protocol),
 		"socket_type":      formatSocketType(sockType),
+		"session_start_ns": int64(timestamp),
+		"session_end_ns":   int64(timestamp),
+		"packets_incoming": int64(0),
+		"packets_outgoing": int64(0),
 
 		// Raw values for further processing if needed
 		"raw_ipv4":     destIPv4,
@@ -130,11 +177,18 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 		"raw_protocol": protocol,
 		"raw_socktype": sockType,
 	}
+	if sourceIP != "" {
+		metadata["source_ip"] = sourceIP
+		metadata["src_ip"] = sourceIP
+	}
+	if serverName != "" {
+		metadata["server_name"] = serverName
+		metadata["sni"] = serverName
+	}
 
 	event := events.NewBaseEvent("connection", pid, command, timestamp, metadata)
 
 	// Debug log the parsed connection event
-	destination := formatDestination(family, destIPv4, destIPv6, destPort)
 	if destination != "" {
 		logger.Debugf("🔗 CONNECTION EVENT: PID=%d cmd=%s dest=%s proto=%s ret=%d",
 			pid, command, destination, formatProtocol(protocol), ret)
@@ -158,13 +212,8 @@ func extractNullTerminatedString(data []byte) string {
 
 // formatIP converts the IP address to a string representation.
 func formatIP(family uint16, ipv4 uint32, ipv6 [16]byte) string {
-	const (
-		AF_INET  = 2
-		AF_INET6 = 10
-	)
-
 	switch family {
-	case AF_INET:
+	case afInet:
 		if ipv4 == 0 {
 			return ""
 		}
@@ -172,7 +221,7 @@ func formatIP(family uint16, ipv4 uint32, ipv6 [16]byte) string {
 		ip := net.IPv4(byte(ipv4), byte(ipv4>>8), byte(ipv4>>16), byte(ipv4>>24))
 		return ip.String()
 
-	case AF_INET6:
+	case afInet6:
 		// Check if IPv6 address is all zeros
 		allZero := true
 		for _, b := range ipv6 {
@@ -194,15 +243,13 @@ func formatIP(family uint16, ipv4 uint32, ipv6 [16]byte) string {
 
 // formatDestination formats the destination as "IP:port".
 func formatDestination(family uint16, ipv4 uint32, ipv6 [16]byte, port uint16) string {
-	const AF_INET6 = 10
-
 	ip := formatIP(family, ipv4, ipv6)
 	if ip == "" {
 		return ""
 	}
 
 	// IPv6 addresses need to be wrapped in brackets
-	if family == AF_INET6 {
+	if family == afInet6 {
 		return fmt.Sprintf("[%s]:%d", ip, port)
 	}
 
@@ -230,5 +277,160 @@ func formatSocketType(sockType uint8) string {
 		return "DGRAM"
 	default:
 		return fmt.Sprintf("Unknown(%d)", sockType)
+	}
+}
+
+func inferSourceIPForFamily(family uint16, destinationIP string) string {
+	sourceIPCacheMu.RLock()
+	if cached, ok := sourceIPCache[family]; ok && time.Since(cached.UpdatedAt) <= sourceIPCacheTTL {
+		sourceIPCacheMu.RUnlock()
+		return cached.Value
+	}
+	sourceIPCacheMu.RUnlock()
+
+	resolved := resolveSourceIP(family, destinationIP)
+	if resolved == "" {
+		resolved = firstNonLoopbackIP(family)
+	}
+	if resolved == "" {
+		return ""
+	}
+
+	sourceIPCacheMu.Lock()
+	sourceIPCache[family] = sourceIPCacheEntry{
+		Value:     resolved,
+		UpdatedAt: time.Now(),
+	}
+	sourceIPCacheMu.Unlock()
+
+	return resolved
+}
+
+func resolveSourceIP(family uint16, destinationIP string) string {
+	network := "udp4"
+	targetHost := destinationIP
+
+	switch family {
+	case afInet6:
+		network = "udp6"
+		if ip := net.ParseIP(targetHost); ip == nil || ip.To16() == nil || ip.To4() != nil {
+			targetHost = "2001:4860:4860::8888"
+		}
+	default:
+		network = "udp4"
+		if ip := net.ParseIP(targetHost); ip == nil || ip.To4() == nil {
+			targetHost = "8.8.8.8"
+		}
+	}
+
+	addr := net.JoinHostPort(targetHost, "53")
+	dialer := net.Dialer{Timeout: 150 * time.Millisecond}
+	conn, err := dialer.Dial(network, addr)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || localAddr == nil || localAddr.IP == nil {
+		return ""
+	}
+
+	return localAddr.IP.String()
+}
+
+func firstNonLoopbackIP(family uint16) string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, iface := range interfaces {
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			default:
+				continue
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+				continue
+			}
+			switch family {
+			case afInet6:
+				if ip.To16() != nil && ip.To4() == nil {
+					return ip.String()
+				}
+			default:
+				if v4 := ip.To4(); v4 != nil {
+					return v4.String()
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func inferServerNameFromIP(destinationIP string) string {
+	ip := net.ParseIP(strings.TrimSpace(destinationIP))
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() || ip.IsMulticast() {
+		return ""
+	}
+
+	cacheKey := ip.String()
+	now := time.Now()
+
+	rdnsCacheMu.RLock()
+	if cached, ok := rdnsCache[cacheKey]; ok && now.Sub(cached.UpdatedAt) <= cached.TTL {
+		rdnsCacheMu.RUnlock()
+		return cached.Value
+	}
+	rdnsCacheMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), rdnsLookupTimeout)
+	defer cancel()
+
+	names, err := net.DefaultResolver.LookupAddr(ctx, cacheKey)
+	if err != nil || len(names) == 0 {
+		cacheRDNSResult(cacheKey, "", rdnsFailureCacheTT)
+		return ""
+	}
+
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(names[0])), ".")
+	if name == "" || net.ParseIP(name) != nil {
+		cacheRDNSResult(cacheKey, "", rdnsFailureCacheTT)
+		return ""
+	}
+
+	cacheRDNSResult(cacheKey, name, rdnsCacheTTL)
+	return name
+}
+
+func cacheRDNSResult(ip, value string, ttl time.Duration) {
+	rdnsCacheMu.Lock()
+	defer rdnsCacheMu.Unlock()
+
+	if len(rdnsCache) >= rdnsCacheMaxKeys {
+		for k := range rdnsCache {
+			delete(rdnsCache, k)
+			break
+		}
+	}
+
+	rdnsCache[ip] = rdnsCacheEntry{
+		Value:     value,
+		UpdatedAt: time.Now(),
+		TTL:       ttl,
 	}
 }

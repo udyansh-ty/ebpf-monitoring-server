@@ -229,6 +229,43 @@ func TestTrackMetaWindowRollupFallsBackToObservedTimestamp(t *testing.T) {
 	}
 }
 
+func TestTrackMetaWindowRollupUsesIngestRemoteIPFallback(t *testing.T) {
+	agg, err := New(&Config{})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"event_type":        "connection",
+		"ingest_remote_ip":  "10.10.10.10",
+		"destination":       "142.250.183.69:443",
+		"session_start_ns":  float64(1773919447000000000),
+		"session_end_ns":    float64(1773919450000000000),
+		"packets_incoming":  float64(1),
+		"packets_outgoing":  float64(2),
+		"packets_incomingx": float64(999), // ignored
+	})
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected one rollup using ingest_remote_ip fallback, got %d", len(agg.metaRollups))
+	}
+
+	key := metaRollupKey{
+		BucketEpoch: 1773919440,
+		SrcIP:       "10.10.10.10",
+		DstIP:       "142.250.183.69",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for key %+v", key)
+	}
+	if entry.PacketsIn != 1 || entry.PacketsOut != 2 {
+		t.Fatalf("unexpected packet counters: %+v", entry)
+	}
+}
+
 func TestTrackMetaWindowRollupSeparatesBySNI(t *testing.T) {
 	agg, err := New(&Config{})
 	if err != nil {

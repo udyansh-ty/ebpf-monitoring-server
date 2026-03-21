@@ -346,9 +346,10 @@ func (a *Aggregator) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process each event
+	requestSourceIP := extractRequestSourceIP(r)
 	processed := 0
 	for _, eventData := range requestData.Events {
-		if err := a.ingestEvent(r.Context(), eventData); err != nil {
+		if err := a.ingestEvent(r.Context(), eventData, requestSourceIP); err != nil {
 			logger.Errorf("Failed to ingest event: %v", err)
 			continue
 		}
@@ -761,11 +762,14 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 // WHY: Enrich connection events with interface information before storage (Phase 1B)
 // WHAT: Optionally apply enricher to extract interface_name/interface_index before storage
 // HOW: Check if enricher available and event is connection type, apply enrichment, then store
-func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage) error {
+func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage, requestSourceIP string) error {
 	// Parse event data into a generic event
 	var eventMap map[string]interface{}
 	if err := json.Unmarshal(eventData, &eventMap); err != nil {
 		return fmt.Errorf("failed to parse event: %v", err)
+	}
+	if requestSourceIP != "" {
+		eventMap["ingest_remote_ip"] = requestSourceIP
 	}
 
 	// Create a simple event wrapper for storage
@@ -821,12 +825,18 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 
 	metadataMaps := collectMetadataMaps(metadata)
 	eventType := strings.ToLower(strings.TrimSpace(findFirstStringValue(metadataMaps, "type", "event_type")))
-	if eventType != "connection" {
+	if eventType != "" && eventType != "connection" {
 		return
 	}
 
-	srcIP := extractNormalizedIP(metadataMaps, "src_ip", "source_ip", "machine_ip", "client_ip")
-	dstIP := extractNormalizedIP(metadataMaps, "dst_ip", "dest_ip", "destination_ip", "server_ip", "remote_ip")
+	srcIP := extractNormalizedIP(metadataMaps,
+		"src_ip", "source_ip", "machine_ip", "client_ip", "local_ip",
+		"ingest_remote_ip", "agent_ip", "source_addr", "src_addr", "saddr",
+	)
+	dstIP := extractNormalizedIP(metadataMaps,
+		"dst_ip", "dest_ip", "destination_ip", "server_ip", "remote_ip",
+		"destination", "remote_addr", "dst_addr", "daddr",
+	)
 	if srcIP == "" || dstIP == "" {
 		return
 	}
@@ -1025,6 +1035,40 @@ func normalizeIP(raw string) string {
 	return ""
 }
 
+func extractRequestSourceIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+
+	for _, candidate := range []string{
+		r.Header.Get("X-Forwarded-For"),
+		r.Header.Get("X-Real-Ip"),
+		r.RemoteAddr,
+	} {
+		if candidate == "" {
+			continue
+		}
+		parts := strings.Split(candidate, ",")
+		value := strings.TrimSpace(parts[0])
+		if value == "" {
+			continue
+		}
+
+		host := value
+		if parsed := net.ParseIP(strings.Trim(host, "[]")); parsed != nil {
+			return parsed.String()
+		}
+		if h, _, err := net.SplitHostPort(value); err == nil {
+			h = strings.Trim(h, "[]")
+			if parsed := net.ParseIP(h); parsed != nil {
+				return parsed.String()
+			}
+		}
+	}
+
+	return ""
+}
+
 func getInt64FromMaps(metadataMaps []map[string]interface{}, keys ...string) (int64, bool) {
 	for _, metadata := range metadataMaps {
 		if metadata == nil {
@@ -1191,14 +1235,24 @@ func epochSecondsFromAuto(v int64) int64 {
 	if v <= 0 {
 		return 0
 	}
+	var seconds int64
 	switch {
 	case v >= 1_000_000_000_000_000: // nanoseconds
-		return v / int64(time.Second)
+		seconds = v / int64(time.Second)
 	case v >= 1_000_000_000_000: // milliseconds
-		return v / int64(time.Millisecond)
+		seconds = v / int64(time.Millisecond)
 	default: // seconds
-		return v
+		seconds = v
 	}
+
+	// Kernel tracepoints frequently emit monotonic timestamps (seconds since boot),
+	// not Unix epoch seconds. These values are typically far below year-2000 epoch.
+	// Map them to "now" to keep retention/window logic valid for rollups.
+	if seconds > 0 && seconds < 946684800 {
+		return time.Now().UTC().Unix()
+	}
+
+	return seconds
 }
 
 // updateStats updates aggregation statistics.

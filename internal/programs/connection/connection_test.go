@@ -129,6 +129,12 @@ func TestParseValidConnectionEvent(t *testing.T) {
 	if metadata["destination_ip"] != "127.0.0.1" {
 		t.Errorf("expected destination_ip '127.0.0.1', got %v", metadata["destination_ip"])
 	}
+	if metadata["dest_ip"] != "127.0.0.1" {
+		t.Errorf("expected dest_ip '127.0.0.1', got %v", metadata["dest_ip"])
+	}
+	if metadata["dst_ip"] != "127.0.0.1" {
+		t.Errorf("expected dst_ip '127.0.0.1', got %v", metadata["dst_ip"])
+	}
 
 	if metadata["destination_port"] != uint16(80) {
 		t.Errorf("expected destination_port 80, got %v", metadata["destination_port"])
@@ -148,6 +154,18 @@ func TestParseValidConnectionEvent(t *testing.T) {
 
 	if metadata["socket_type"] != "STREAM" {
 		t.Errorf("expected socket_type 'STREAM', got %v", metadata["socket_type"])
+	}
+	if metadata["session_start_ns"] != int64(1000000) {
+		t.Errorf("expected session_start_ns 1000000, got %v", metadata["session_start_ns"])
+	}
+	if metadata["session_end_ns"] != int64(1000000) {
+		t.Errorf("expected session_end_ns 1000000, got %v", metadata["session_end_ns"])
+	}
+	if metadata["packets_incoming"] != int64(0) {
+		t.Errorf("expected packets_incoming 0, got %v", metadata["packets_incoming"])
+	}
+	if metadata["packets_outgoing"] != int64(0) {
+		t.Errorf("expected packets_outgoing 0, got %v", metadata["packets_outgoing"])
 	}
 }
 
