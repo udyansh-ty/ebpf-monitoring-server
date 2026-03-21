@@ -51,6 +51,9 @@ func (s *metaWindowTestStorage) rowsByKey() map[metaRollupKey]storage.EBPFMetaWi
 			BucketEpoch: row.BucketEpoch,
 			SrcIP:       row.SrcIP,
 			DstIP:       row.DstIP,
+			SrcPort:     row.SrcPort,
+			DstPort:     row.DstPort,
+			Interface:   row.InterfaceName,
 			SNI:         row.SNI,
 		}
 		out[key] = row
@@ -215,6 +218,8 @@ func TestTrackMetaWindowRollupFallsBackToObservedTimestamp(t *testing.T) {
 		BucketEpoch: 1773919440,
 		SrcIP:       "10.10.10.10",
 		DstIP:       "142.250.183.69",
+		SrcPort:     51000,
+		DstPort:     443,
 		SNI:         "mail.google.com",
 	}
 	entry, ok := agg.metaRollups[key]
@@ -256,6 +261,7 @@ func TestTrackMetaWindowRollupUsesIngestRemoteIPFallback(t *testing.T) {
 		BucketEpoch: 1773919440,
 		SrcIP:       "10.10.10.10",
 		DstIP:       "142.250.183.69",
+		DstPort:     443,
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -302,6 +308,47 @@ func TestTrackMetaWindowRollupSeparatesBySNI(t *testing.T) {
 	defer agg.metaMu.RUnlock()
 	if len(agg.metaRollups) != 2 {
 		t.Fatalf("expected 2 rollup keys split by sni, got %d", len(agg.metaRollups))
+	}
+}
+
+func TestTrackMetaWindowRollupSeparatesByPortAndInterface(t *testing.T) {
+	agg, err := New(&Config{})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"type":             "connection",
+		"src_ip":           "192.168.1.25",
+		"dst_ip":           "142.250.183.69",
+		"src_port":         float64(51000),
+		"dst_port":         float64(443),
+		"interface_name":   "eth0",
+		"duration_ms":      float64(1000),
+		"packets_incoming": float64(1),
+		"packets_outgoing": float64(2),
+		"session_start_ns": float64(1773919447000000000),
+		"session_end_ns":   float64(1773919458000000000),
+	})
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"type":             "connection",
+		"src_ip":           "192.168.1.25",
+		"dst_ip":           "142.250.183.69",
+		"src_port":         float64(51000),
+		"dst_port":         float64(443),
+		"interface_name":   "enp7s0",
+		"duration_ms":      float64(1000),
+		"packets_incoming": float64(1),
+		"packets_outgoing": float64(2),
+		"session_start_ns": float64(1773919447000000000),
+		"session_end_ns":   float64(1773919458000000000),
+	})
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+	if len(agg.metaRollups) != 2 {
+		t.Fatalf("expected 2 rollup keys split by interface, got %d", len(agg.metaRollups))
 	}
 }
 

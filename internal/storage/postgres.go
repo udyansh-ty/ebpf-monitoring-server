@@ -37,6 +37,9 @@ type EBPFMetaWindowRow struct {
 	BucketEpoch    int64
 	SrcIP          string
 	DstIP          string
+	SrcPort        int64
+	DstPort        int64
+	InterfaceName  string
 	SNI            string
 	ActiveSeconds  int64
 	PacketsIn      int64
@@ -58,15 +61,15 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 
 	sql := `
 		INSERT INTO ebpf_meta_window (
-			bucket_epoch, src_ip, dst_ip, sni,
+			bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni,
 			active_seconds, packets_in, packets_out, session_count,
 			first_seen_epoch, last_seen_epoch
 		) VALUES (
-			$1, $2, $3, $4,
-			$5, $6, $7, $8,
-			$9, $10
+			$1, $2, $3, $4, $5, $6, $7,
+			$8, $9, $10, $11,
+			$12, $13
 		)
-		ON CONFLICT (bucket_epoch, src_ip, dst_ip, sni) DO UPDATE SET
+		ON CONFLICT (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni) DO UPDATE SET
 			active_seconds = ebpf_meta_window.active_seconds + EXCLUDED.active_seconds,
 			packets_in = ebpf_meta_window.packets_in + EXCLUDED.packets_in,
 			packets_out = ebpf_meta_window.packets_out + EXCLUDED.packets_out,
@@ -86,7 +89,7 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 	batch := &pgx.Batch{}
 	for _, row := range rows {
 		batch.Queue(sql,
-			row.BucketEpoch, row.SrcIP, row.DstIP, row.SNI,
+			row.BucketEpoch, row.SrcIP, row.DstIP, row.SrcPort, row.DstPort, row.InterfaceName, row.SNI,
 			row.ActiveSeconds, row.PacketsIn, row.PacketsOut, row.SessionCount,
 			row.FirstSeenEpoch, row.LastSeenEpoch,
 		)

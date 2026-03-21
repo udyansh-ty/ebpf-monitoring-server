@@ -154,6 +154,9 @@ type metaRollupKey struct {
 	BucketEpoch int64
 	SrcIP       string
 	DstIP       string
+	SrcPort     int64
+	DstPort     int64
+	Interface   string
 	SNI         string
 }
 
@@ -703,6 +706,9 @@ func (a *Aggregator) drainMetaRollups(nowEpoch int64) []storage.EBPFMetaWindowRo
 			BucketEpoch:    key.BucketEpoch,
 			SrcIP:          key.SrcIP,
 			DstIP:          key.DstIP,
+			SrcPort:        key.SrcPort,
+			DstPort:        key.DstPort,
+			InterfaceName:  key.Interface,
 			SNI:            key.SNI,
 			ActiveSeconds:  entry.ActiveSeconds,
 			PacketsIn:      entry.PacketsIn,
@@ -729,6 +735,9 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 			BucketEpoch: row.BucketEpoch,
 			SrcIP:       row.SrcIP,
 			DstIP:       row.DstIP,
+			SrcPort:     row.SrcPort,
+			DstPort:     row.DstPort,
+			Interface:   strings.TrimSpace(row.InterfaceName),
 			SNI:         row.SNI,
 		}
 
@@ -906,11 +915,23 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		packetsOut = 0
 	}
 	sni := extractSNI(metadataMaps)
+	srcPort := normalizePort(findFirstPort(metadataMaps, "src_port", "source_port", "sport"))
+	dstPort := normalizePort(findFirstPort(metadataMaps, "dst_port", "dest_port", "destination_port", "dport", "port"))
+	if srcPort == 0 {
+		srcPort = normalizePort(extractPortFromEndpoint(findFirstStringValue(metadataMaps, "src_ip", "source_ip", "source_addr", "src_addr")))
+	}
+	if dstPort == 0 {
+		dstPort = normalizePort(extractPortFromEndpoint(findFirstStringValue(metadataMaps, "destination", "dst_ip", "dest_ip", "destination_ip", "remote_addr", "dst_addr")))
+	}
+	iface := strings.TrimSpace(findFirstStringValue(metadataMaps, "interface_name", "interface", "iface"))
 
 	key := metaRollupKey{
 		BucketEpoch: bucketEpoch,
 		SrcIP:       srcIP,
 		DstIP:       dstIP,
+		SrcPort:     srcPort,
+		DstPort:     dstPort,
+		Interface:   iface,
 		SNI:         sni,
 	}
 
@@ -1079,6 +1100,40 @@ func getInt64FromMaps(metadataMaps []map[string]interface{}, keys ...string) (in
 		}
 	}
 	return 0, false
+}
+
+func findFirstPort(metadataMaps []map[string]interface{}, keys ...string) int64 {
+	if value, ok := getInt64FromMaps(metadataMaps, keys...); ok {
+		return value
+	}
+	return 0
+}
+
+func normalizePort(port int64) int64 {
+	if port < 0 || port > 65535 {
+		return 0
+	}
+	return port
+}
+
+func extractPortFromEndpoint(raw string) int64 {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0
+	}
+	if parsedURL, err := url.Parse(value); err == nil && parsedURL.Host != "" {
+		value = parsedURL.Host
+	}
+	host, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return 0
+	}
+	_ = host
+	parsed, err := strconv.ParseInt(strings.TrimSpace(port), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }
 
 func (a *Aggregator) pruneMetaRollups(nowEpoch int64) {

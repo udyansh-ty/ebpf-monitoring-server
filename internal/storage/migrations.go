@@ -252,7 +252,7 @@ GROUP BY interface_name, event_type;
 `
 
 // ANCHOR: eBPF Metadata Window Aggregate Table - Phase 2
-// WHY: Persist only short-window aggregate metadata keyed by minute bucket + src/dst IP
+// WHY: Persist only short-window aggregate metadata keyed by minute bucket + flow dimensions
 // WHAT: Lightweight aggregate table for bounded retention and lower write amplification
 // HOW: UNLOGGED table with compact counters and minimal indexing
 const createEBPFMetaWindowTable = `
@@ -260,6 +260,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS ebpf_meta_window (
   bucket_epoch      BIGINT NOT NULL,  -- minute bucket epoch, UTC, divisible by 60
   src_ip            INET   NOT NULL,
   dst_ip            INET   NOT NULL,
+  src_port          INT    NOT NULL DEFAULT 0,
+  dst_port          INT    NOT NULL DEFAULT 0,
+  interface_name    TEXT   NOT NULL DEFAULT '',
   sni               TEXT   NOT NULL DEFAULT '',
   active_seconds    BIGINT NOT NULL DEFAULT 0,
   packets_in        BIGINT NOT NULL DEFAULT 0,
@@ -267,7 +270,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS ebpf_meta_window (
   session_count     BIGINT NOT NULL DEFAULT 0,
   first_seen_epoch  BIGINT NOT NULL,
   last_seen_epoch   BIGINT NOT NULL,
-  PRIMARY KEY (bucket_epoch, src_ip, dst_ip, sni)
+  PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_time
@@ -276,11 +279,14 @@ CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_time
 CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_dst_time
   ON ebpf_meta_window (dst_ip, bucket_epoch DESC);
 
+CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_iface_time
+  ON ebpf_meta_window (interface_name, bucket_epoch DESC);
+
 CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_sni_time
   ON ebpf_meta_window (sni, bucket_epoch DESC);
 `
 
-const ensureEBPFMetaWindowSNISchema = `
+const ensureEBPFMetaWindowDimensionSchema = `
 DO $$
 DECLARE
   pk_name TEXT;
@@ -288,6 +294,12 @@ DECLARE
 BEGIN
   ALTER TABLE ebpf_meta_window
     ADD COLUMN IF NOT EXISTS sni TEXT NOT NULL DEFAULT '';
+  ALTER TABLE ebpf_meta_window
+    ADD COLUMN IF NOT EXISTS src_port INT NOT NULL DEFAULT 0;
+  ALTER TABLE ebpf_meta_window
+    ADD COLUMN IF NOT EXISTS dst_port INT NOT NULL DEFAULT 0;
+  ALTER TABLE ebpf_meta_window
+    ADD COLUMN IF NOT EXISTS interface_name TEXT NOT NULL DEFAULT '';
 
   SELECT EXISTS (
     SELECT 1
@@ -295,7 +307,7 @@ BEGIN
     JOIN pg_class t ON c.conrelid = t.oid
     WHERE t.relname = 'ebpf_meta_window'
       AND c.contype = 'p'
-      AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (bucket_epoch, src_ip, dst_ip, sni)'
+      AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni)'
   ) INTO has_target_pk;
 
   IF NOT has_target_pk THEN
@@ -310,7 +322,7 @@ BEGIN
     END IF;
 
     ALTER TABLE ebpf_meta_window
-      ADD PRIMARY KEY (bucket_epoch, src_ip, dst_ip, sni);
+      ADD PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni);
   END IF;
 END;
 $$;
@@ -333,9 +345,9 @@ func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 		return fmt.Errorf("failed to create ebpf_meta_window table: %w", err)
 	}
 
-	_, err = conn.Exec(ctx, ensureEBPFMetaWindowSNISchema)
+	_, err = conn.Exec(ctx, ensureEBPFMetaWindowDimensionSchema)
 	if err != nil {
-		return fmt.Errorf("failed to migrate ebpf_meta_window sni schema: %w", err)
+		return fmt.Errorf("failed to migrate ebpf_meta_window dimension schema: %w", err)
 	}
 
 	return nil
