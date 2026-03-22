@@ -40,7 +40,8 @@ func main() {
 		jwtConfig.SigningKey = auth.GenerateSecret()
 	}
 
-	// Check if debug logging is enabled
+	// Enable debug logging to see detailed resolution output
+	logger.SetDebug()
 	logger.Info("Starting eBPF Network Monitor...")
 	logger.Debug("Debug logging is enabled")
 	logger.Debugf("Debug logging test - IsDebugEnabled: %v", logger.IsDebugEnabled())
