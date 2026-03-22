@@ -878,7 +878,7 @@ func resolveInterfaceIPv4(destIP string) string {
 	logger.Debugf("[Route Debug] Searching for IP: %s (little-endian uint32: 0x%08X)", destIP, destIPUint)
 
 	var bestMatch string
-	var bestMaskLen int
+	var bestMaskLen int = -1  // Initialize to -1 so default route (0 bits) matches
 	var routeCount int
 
 	for scanner.Scan() {
