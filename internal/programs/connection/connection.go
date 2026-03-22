@@ -964,9 +964,11 @@ func resolveInterfaceIPv6(destIP string) string {
 		return ""
 	}
 
+	logger.Debugf("[IPv6 Route Debug] Searching for IP: %s", destIP)
+
 	scanner := bufio.NewScanner(file)
 	var bestMatch string
-	var bestPrefixLen int
+	var bestPrefixLen int = -1  // Initialize to -1 so default route (0 prefix) matches
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1003,10 +1005,18 @@ func resolveInterfaceIPv6(destIP string) string {
 		// Check if destination matches using CIDR mask
 		mask := net.CIDRMask(int(prefixLen), 128)
 		if mask == nil {
+			logger.Debugf("[IPv6 Route %s] Invalid mask for prefix %d", iface, prefixLen)
 			continue
 		}
 
-		if destIPParsed.Mask(mask).Equal(routeIPParsed.Mask(mask)) {
+		destMasked := destIPParsed.Mask(mask)
+		routeMasked := routeIPParsed.Mask(mask)
+		matches := destMasked.Equal(routeMasked)
+
+		logger.Debugf("[IPv6 Route %s] destIP=%s, routeIP=%s, prefix=%d, destMasked=%s, routeMasked=%s, matches=%v",
+			iface, destIP, routeIP, prefixLen, destMasked, routeMasked, matches)
+
+		if matches {
 			// Keep most specific route (highest prefix length)
 			if int(prefixLen) > bestPrefixLen {
 				bestPrefixLen = int(prefixLen)
