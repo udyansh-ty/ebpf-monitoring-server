@@ -669,22 +669,48 @@ func parseProcNetAddr(addr string) (net.IP, uint16, bool) {
 
 // findSourcePortDirect performs a direct lookup of source port from /proc/net/tcp[6]
 // by scanning all entries for a matching destination address and port.
-// This is a fallback when inode-based matching fails.
+// First tries process-specific view (/proc/PID/net/tcp[6]) which is more reliable,
+// then falls back to global view (/proc/net/tcp[6]).
 func findSourcePortDirect(pid uint32, destIP string, destPort uint16, protocol uint8) uint16 {
 	if pid == 0 || destIP == "" || destPort == 0 {
 		return 0
 	}
 
-	procFile := "/proc/net/tcp"
-	if protocol == protoUDP {
-		procFile = "/proc/net/udp"
+	remoteIP := net.ParseIP(destIP)
+	if remoteIP == nil {
+		logger.Debugf("Failed to parse destination IP for port lookup: %s", destIP)
+		return 0
 	}
-	if strings.Contains(destIP, ":") {
+
+	// Try process-specific view first (more reliable)
+	if port := findSourcePortFromProcNet(pid, remoteIP, destPort, protocol); port != 0 {
+		logger.Debugf("Found source port via /proc/%d/net: %d", pid, port)
+		return port
+	}
+
+	// Fall back to global view
+	if port := findSourcePortFromGlobalNet(remoteIP, destPort, protocol); port != 0 {
+		logger.Debugf("Found source port via /proc/net: %d", port)
+		return port
+	}
+
+	logger.Debugf("Could not resolve source port for %s:%d", destIP, destPort)
+	return 0
+}
+
+// findSourcePortFromProcNet tries to find source port from process-specific net file
+func findSourcePortFromProcNet(pid uint32, remoteIP net.IP, destPort uint16, protocol uint8) uint16 {
+	procFile := fmt.Sprintf("/proc/%d/net/tcp", pid)
+	if protocol == protoUDP {
+		procFile = fmt.Sprintf("/proc/%d/net/udp", pid)
+	}
+	if remoteIP.To4() == nil {
 		procFile += "6"
 	}
 
 	file, err := os.Open(procFile)
 	if err != nil {
+		logger.Debugf("Failed to open %s: %v", procFile, err)
 		return 0
 	}
 	defer file.Close()
@@ -695,8 +721,58 @@ func findSourcePortDirect(pid uint32, destIP string, destPort uint16, protocol u
 		return 0
 	}
 
-	remoteIP := net.ParseIP(destIP)
-	if remoteIP == nil {
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+
+		localAddr := fields[1]
+		remoteAddr := fields[2]
+
+		// Parse remote address
+		remoteParsedIP, remoteParsedPort, ok := parseProcNetAddr(remoteAddr)
+		if !ok {
+			continue
+		}
+
+		// Check if destination matches
+		if !remoteParsedIP.Equal(remoteIP) || remoteParsedPort != destPort {
+			continue
+		}
+
+		// Found matching entry, extract local port
+		_, localPort, ok := parseProcNetAddr(localAddr)
+		if !ok {
+			continue
+		}
+
+		return localPort
+	}
+
+	return 0
+}
+
+// findSourcePortFromGlobalNet tries to find source port from global net files
+func findSourcePortFromGlobalNet(remoteIP net.IP, destPort uint16, protocol uint8) uint16 {
+	procFile := "/proc/net/tcp"
+	if protocol == protoUDP {
+		procFile = "/proc/net/udp"
+	}
+	if remoteIP.To4() == nil {
+		procFile += "6"
+	}
+
+	file, err := os.Open(procFile)
+	if err != nil {
+		logger.Debugf("Failed to open %s: %v", procFile, err)
+		return 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	// Skip header
+	if !scanner.Scan() {
 		return 0
 	}
 
@@ -741,20 +817,35 @@ func resolveInterfaceFromRoute(destIP string) string {
 
 	ip := net.ParseIP(destIP)
 	if ip == nil {
+		logger.Debugf("Failed to parse destination IP: %s", destIP)
 		return ""
 	}
 
 	// Check if IPv4 or IPv6
 	if ip.To4() != nil {
-		return resolveInterfaceIPv4(ip.String())
+		iface := resolveInterfaceIPv4(ip.String())
+		if iface != "" {
+			logger.Debugf("Resolved IPv4 interface for %s: %s", destIP, iface)
+		} else {
+			logger.Debugf("Failed to resolve IPv4 interface for %s", destIP)
+		}
+		return iface
 	}
-	return resolveInterfaceIPv6(ip.String())
+
+	iface := resolveInterfaceIPv6(ip.String())
+	if iface != "" {
+		logger.Debugf("Resolved IPv6 interface for %s: %s", destIP, iface)
+	} else {
+		logger.Debugf("Failed to resolve IPv6 interface for %s", destIP)
+	}
+	return iface
 }
 
 // resolveInterfaceIPv4 finds the interface for an IPv4 destination
 func resolveInterfaceIPv4(destIP string) string {
 	file, err := os.Open("/proc/net/route")
 	if err != nil {
+		logger.Debugf("Failed to open /proc/net/route: %v", err)
 		return ""
 	}
 	defer file.Close()
@@ -762,39 +853,49 @@ func resolveInterfaceIPv4(destIP string) string {
 	scanner := bufio.NewScanner(file)
 	// Skip header
 	if !scanner.Scan() {
+		logger.Debugf("Failed to read header from /proc/net/route")
 		return ""
 	}
 
 	destIPParsed := net.ParseIP(destIP).To4()
 	if destIPParsed == nil {
+		logger.Debugf("Invalid IPv4 address for route lookup: %s", destIP)
 		return ""
 	}
 
-	// Convert destination IP to uint32 for comparison
+	// Convert destination IP to uint32 for comparison (in network byte order as stored in route table)
 	destIPUint := uint32(destIPParsed[0]) | (uint32(destIPParsed[1]) << 8) | (uint32(destIPParsed[2]) << 16) | (uint32(destIPParsed[3]) << 24)
 
 	var bestMatch string
 	var bestMaskLen int
 
 	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 3 {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		// /proc/net/route format: Iface Destination Gateway Flags RefCnt Use Metric Mask
+		if len(fields) < 8 {
 			continue
 		}
 
 		iface := fields[0]
 		destField := fields[1]
-		maskField := fields[2]
+		maskField := fields[7]
 
 		// Parse destination (little-endian hex)
 		destVal, err := strconv.ParseUint(destField, 16, 32)
 		if err != nil {
+			logger.Debugf("Failed to parse IPv4 route destination: %s, error: %v", destField, err)
 			continue
 		}
 
 		// Parse mask (little-endian hex)
 		maskVal, err := strconv.ParseUint(maskField, 16, 32)
 		if err != nil {
+			logger.Debugf("Failed to parse IPv4 route mask: %s, error: %v", maskField, err)
 			continue
 		}
 
@@ -805,8 +906,17 @@ func resolveInterfaceIPv4(destIP string) string {
 			if maskLen > bestMaskLen {
 				bestMaskLen = maskLen
 				bestMatch = iface
+				logger.Debugf("Found IPv4 route match for %s: iface=%s mask_bits=%d", destIP, iface, maskLen)
 			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.Debugf("Error reading route table: %v", err)
+	}
+
+	if bestMatch == "" {
+		logger.Debugf("No IPv4 route found for %s", destIP)
 	}
 
 	return bestMatch
@@ -816,6 +926,7 @@ func resolveInterfaceIPv4(destIP string) string {
 func resolveInterfaceIPv6(destIP string) string {
 	file, err := os.Open("/proc/net/ipv6_route")
 	if err != nil {
+		logger.Debugf("Failed to open /proc/net/ipv6_route: %v", err)
 		return ""
 	}
 	defer file.Close()
@@ -824,6 +935,7 @@ func resolveInterfaceIPv6(destIP string) string {
 
 	destIPParsed := net.ParseIP(destIP)
 	if destIPParsed == nil || destIPParsed.To4() != nil {
+		logger.Debugf("Invalid IPv6 address for route lookup: %s", destIP)
 		return ""
 	}
 
@@ -831,8 +943,17 @@ func resolveInterfaceIPv6(destIP string) string {
 	var bestPrefixLen int
 
 	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 2 {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		// /proc/net/ipv6_route format:
+		// destination metric next_hop flags refcnt use metric iface
+		// Fields: 0=dest, 1=destprefix, 2=nexthop, 3=metric, 4=use, 5=flags, 6=refcnt, 7=use, 8=metric, 9=iface
+		if len(fields) < 10 {
+			logger.Debugf("IPv6 route line has too few fields: %d", len(fields))
 			continue
 		}
 
@@ -840,31 +961,47 @@ func resolveInterfaceIPv6(destIP string) string {
 		prefixField := fields[1]
 		iface := fields[9]
 
-		// Parse prefix length
+		// Skip invalid interface names
+		if iface == "" || strings.Contains(iface, ":") {
+			continue
+		}
+
+		// Parse prefix length (it's in hex in the file)
 		prefixLen, err := strconv.ParseInt(prefixField, 16, 8)
 		if err != nil {
+			logger.Debugf("Failed to parse IPv6 prefix: %s, error: %v", prefixField, err)
 			continue
 		}
 
 		// Parse destination IPv6 address
 		routeIPStr := convertIPv6HexToString(destField)
 		if routeIPStr == "" {
+			logger.Debugf("Failed to convert IPv6 hex to string: %s", destField)
 			continue
 		}
 
 		routeIP := net.ParseIP(routeIPStr)
 		if routeIP == nil {
+			logger.Debugf("Failed to parse route IP: %s (from hex: %s)", routeIPStr, destField)
 			continue
 		}
 
-		// Check if destination matches this route
-		ones, bits := net.IPNet{IP: routeIP, Mask: net.CIDRMask(int(prefixLen), 128)}.Mask.Size()
-		if bits == 128 && matchesIPv6Route(destIPParsed, routeIP, int(prefixLen)) {
-			if ones > bestPrefixLen {
-				bestPrefixLen = ones
+		// Check if destination matches this route using CIDR matching
+		if matchesIPv6Route(destIPParsed, routeIP, int(prefixLen)) {
+			if int(prefixLen) > bestPrefixLen {
+				bestPrefixLen = int(prefixLen)
 				bestMatch = iface
+				logger.Debugf("Found IPv6 route match for %s: iface=%s prefix=%d", destIP, iface, prefixLen)
 			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.Debugf("Error reading ipv6_route: %v", err)
+	}
+
+	if bestMatch == "" {
+		logger.Debugf("No IPv6 route found for %s", destIP)
 	}
 
 	return bestMatch
