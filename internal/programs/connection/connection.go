@@ -875,9 +875,11 @@ func resolveInterfaceIPv4(destIP string) string {
 
 	// Convert to uint32 in little-endian format (as stored in /proc/net/route)
 	destIPUint := uint32(destIPv4[0]) | (uint32(destIPv4[1]) << 8) | (uint32(destIPv4[2]) << 16) | (uint32(destIPv4[3]) << 24)
+	logger.Debugf("[Route Debug] Searching for IP: %s (little-endian uint32: 0x%08X)", destIP, destIPUint)
 
 	var bestMatch string
 	var bestMaskLen int
+	var routeCount int
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -889,6 +891,8 @@ func resolveInterfaceIPv4(destIP string) string {
 			continue
 		}
 
+		routeCount++
+
 		iface := fields[0]
 		destStr := fields[1]
 		maskStr := fields[7]
@@ -899,15 +903,20 @@ func resolveInterfaceIPv4(destIP string) string {
 		maskBytes := make([]byte, 4)
 
 		if _, errD := hex.Decode(destBytes, []byte(destStr)); errD != nil {
+			logger.Debugf("[Route] Failed to decode dest %s: %v", destStr, errD)
 			continue
 		}
 		if _, errM := hex.Decode(maskBytes, []byte(maskStr)); errM != nil {
+			logger.Debugf("[Route] Failed to decode mask %s: %v", maskStr, errM)
 			continue
 		}
 
 		// Convert little-endian bytes to uint32
 		dest := uint32(destBytes[0]) | (uint32(destBytes[1]) << 8) | (uint32(destBytes[2]) << 16) | (uint32(destBytes[3]) << 24)
 		mask := uint32(maskBytes[0]) | (uint32(maskBytes[1]) << 8) | (uint32(maskBytes[2]) << 16) | (uint32(maskBytes[3]) << 24)
+
+		logger.Debugf("[Route %s] dest=0x%08X (from %s bytes %v), mask=0x%08X, destIP=0x%08X, check: (0x%08X & 0x%08X) = 0x%08X == 0x%08X?",
+			iface, dest, destStr, destBytes, mask, destIPUint, destIPUint, mask, destIPUint&mask, dest)
 
 		// Check if destination IP matches this route
 		if (destIPUint & mask) == dest {
@@ -923,7 +932,7 @@ func resolveInterfaceIPv4(destIP string) string {
 	}
 
 	if bestMatch == "" {
-		logger.Debugf("✗ No IPv4 route found for: %s", destIP)
+		logger.Debugf("✗ No IPv4 route found for: %s (checked %d routes)", destIP, routeCount)
 		return ""
 	}
 
