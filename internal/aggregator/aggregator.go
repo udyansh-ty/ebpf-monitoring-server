@@ -835,7 +835,7 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage,
 
 func isMetaWindowOnlyEventType(eventType string) bool {
 	switch eventType {
-	case "connection", "packet_drop", "packet", "process", "process_exec", "file_operation":
+	case "connection", "connection_close", "packet_drop", "packet", "process", "process_exec", "file_operation":
 		return true
 	default:
 		return false
@@ -849,22 +849,65 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 
 	metadataMaps := collectMetadataMaps(metadata)
 	eventType := strings.ToLower(strings.TrimSpace(findFirstStringValue(metadataMaps, "type", "event_type")))
-	if eventType != "" && eventType != "connection" {
+	if eventType != "" && eventType != "connection" && eventType != "connection_close" {
 		return
 	}
 
-	srcIP := extractNormalizedIP(metadataMaps,
-		"src_ip", "source_ip", "machine_ip", "client_ip", "local_ip",
-		"ingest_remote_ip", "agent_ip", "source_addr", "src_addr", "saddr",
-	)
 	dstIP := extractNormalizedIP(metadataMaps,
 		"dst_ip", "dest_ip", "destination_ip", "server_ip", "remote_ip",
 		"destination", "remote_addr", "dst_addr", "daddr",
 	)
-	if srcIP == "" || dstIP == "" {
+	if dstIP == "" {
 		return
 	}
-	if net.ParseIP(srcIP) == nil || net.ParseIP(dstIP) == nil {
+	if net.ParseIP(dstIP) == nil {
+		return
+	}
+
+	// Handle connection_close events: correlate by (dst_ip, dst_port) and update existing entries
+	if eventType == "connection_close" {
+		dstPort := normalizePort(findFirstPort(metadataMaps, "dst_port", "dest_port", "destination_port", "dport", "port"))
+
+		// Extract final packet counts and active_seconds from close event
+		packetsIn, _ := getInt64FromMaps(metadataMaps, "packets_incoming", "packets_in", "incoming_packets", "rx_packets")
+		packetsOut, _ := getInt64FromMaps(metadataMaps, "packets_outgoing", "packets_out", "outgoing_packets", "tx_packets")
+		if packetsIn < 0 {
+			packetsIn = 0
+		}
+		if packetsOut < 0 {
+			packetsOut = 0
+		}
+
+		activeSeconds, _ := getInt64FromMaps(metadataMaps, "active_seconds")
+		if activeSeconds < 0 {
+			activeSeconds = 0
+		}
+
+		// Correlate by destination to match the original connect event's rollup entry
+		// Update ALL rollup entries that match this destination
+		a.metaMu.Lock()
+		defer a.metaMu.Unlock()
+
+		for key, entry := range a.metaRollups {
+			if key.DstIP == dstIP && key.DstPort == dstPort {
+				// Update with final packet counts and active_seconds from close event
+				entry.PacketsIn = packetsIn
+				entry.PacketsOut = packetsOut
+				entry.ActiveSeconds = activeSeconds
+			}
+		}
+		return
+	}
+
+	// Handle regular connection events
+	srcIP := extractNormalizedIP(metadataMaps,
+		"src_ip", "source_ip", "machine_ip", "client_ip", "local_ip",
+		"ingest_remote_ip", "agent_ip", "source_addr", "src_addr", "saddr",
+	)
+	if srcIP == "" {
+		return
+	}
+	if net.ParseIP(srcIP) == nil {
 		return
 	}
 

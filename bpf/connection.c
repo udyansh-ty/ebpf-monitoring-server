@@ -202,6 +202,258 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx) {
         e->dest_port = 0;
     }
 
+    // Store connection in tracking map for lifecycle monitoring
+    int fd = (int)ctx->args[0];
+    struct conn_key_t conn_key = { .pid = e->pid, .fd = fd };
+    struct conn_state_t conn_state = {
+        .start_ns      = e->ts,
+        .first_pkt_ns  = 0,
+        .last_pkt_ns   = 0,
+        .pkts_sent     = 0,
+        .pkts_recv     = 0,
+        .dest_ip       = e->dest_ip,
+        .dest_port     = e->dest_port,
+        .family        = e->family,
+        .protocol      = e->protocol,
+    };
+
+    // Copy IPv6 address
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        conn_state.dest_ip6[i] = e->dest_ip6[i];
+    }
+
+    bpf_map_update_elem(&active_conns, &conn_key, &conn_state, BPF_ANY);
+
     bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// ============================================================================
+// CONNECTION LIFECYCLE TRACKING - Track packets and connection duration
+// ============================================================================
+
+// Key to identify a connection: (pid, file descriptor)
+struct conn_key_t {
+    u32 pid;
+    int fd;
+} __attribute__((packed));
+
+// State tracked for each active connection
+struct conn_state_t {
+    u64 start_ns;        // When connect() was called
+    u64 first_pkt_ns;    // When first packet was sent/received
+    u64 last_pkt_ns;     // When last packet was sent/received
+    u64 pkts_sent;       // Count of write/sendmsg calls
+    u64 pkts_recv;       // Count of read/recvmsg calls
+    u32 dest_ip;         // Destination IPv4
+    u8  dest_ip6[16];    // Destination IPv6
+    u16 dest_port;       // Destination port
+    u16 family;          // AF_INET or AF_INET6
+    u8  protocol;        // IPPROTO_TCP or IPPROTO_UDP
+    u8  pad[7];          // Alignment padding
+} __attribute__((packed));
+
+// Map to track active connections: (pid, fd) -> connection state
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct conn_key_t);
+    __type(value, struct conn_state_t);
+} active_conns SEC(".maps");
+
+// Per-CPU scratch space to pass fd from sys_enter_* to sys_exit_*
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, int);
+} scratch_fd SEC(".maps");
+
+// Event structure for connection close with complete stats
+struct close_event_t {
+    u32 pid;             // Process ID
+    u64 start_ns;        // When connection was established
+    u64 first_pkt_ns;    // When first packet was sent/received
+    u64 last_pkt_ns;     // When last packet was sent/received
+    u64 pkts_sent;       // Number of packets sent
+    u64 pkts_recv;       // Number of packets received
+    u32 dest_ip;         // Destination IPv4
+    u8  dest_ip6[16];    // Destination IPv6
+    u16 dest_port;       // Destination port
+    u16 family;          // Address family
+    u8  protocol;        // Protocol type
+    u8  pad[1];          // Alignment
+} __attribute__((packed));
+
+// Ring buffer for close events (4MB)
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 22);
+} close_events SEC(".maps");
+
+// ============================================================================
+// TRACEPOINT: sys_enter_connect - Store connection state
+// ============================================================================
+
+// Note: trace_connect is already defined above, but we'll add map population
+
+// ============================================================================
+// TRACEPOINT: sys_enter_write - Capture fd for write tracking
+// ============================================================================
+
+SEC("tracepoint/syscalls/sys_enter_write")
+int trace_enter_write(struct trace_event_raw_sys_enter *ctx) {
+    // ctx->args[0] = fd
+    // Store fd in per-cpu scratch for sys_exit_write to use
+    int fd = (int)ctx->args[0];
+    u32 zero = 0;
+    bpf_map_update_elem(&scratch_fd, &zero, &fd, BPF_ANY);
+    return 0;
+}
+
+// ============================================================================
+// TRACEPOINT: sys_exit_write - Update packet tracking
+// ============================================================================
+
+SEC("tracepoint/syscalls/sys_exit_write")
+int trace_exit_write(struct trace_event_raw_sys_exit *ctx) {
+    // ctx->ret = number of bytes written (or negative error code)
+    if ((long)ctx->ret <= 0) return 0;
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u32 zero = 0;
+
+    // Get fd from scratch space
+    int *fd_ptr = bpf_map_lookup_elem(&scratch_fd, &zero);
+    if (!fd_ptr) return 0;
+    int fd = *fd_ptr;
+
+    // Look up connection state
+    struct conn_key_t key = { .pid = pid, .fd = fd };
+    struct conn_state_t *state = bpf_map_lookup_elem(&active_conns, &key);
+    if (!state) return 0;
+
+    u64 now = bpf_ktime_get_ns();
+
+    // Update packet tracking
+    if (state->first_pkt_ns == 0) {
+        state->first_pkt_ns = now;
+    }
+    state->last_pkt_ns = now;
+    state->pkts_sent++;
+
+    return 0;
+}
+
+// ============================================================================
+// TRACEPOINT: sys_enter_read - Capture fd for read tracking
+// ============================================================================
+
+SEC("tracepoint/syscalls/sys_enter_read")
+int trace_enter_read(struct trace_event_raw_sys_enter *ctx) {
+    // ctx->args[0] = fd
+    int fd = (int)ctx->args[0];
+    u32 zero = 0;
+    bpf_map_update_elem(&scratch_fd, &zero, &fd, BPF_ANY);
+    return 0;
+}
+
+// ============================================================================
+// TRACEPOINT: sys_exit_read - Update packet tracking
+// ============================================================================
+
+SEC("tracepoint/syscalls/sys_exit_read")
+int trace_exit_read(struct trace_event_raw_sys_exit *ctx) {
+    // ctx->ret = number of bytes read (or negative error code)
+    if ((long)ctx->ret <= 0) return 0;
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u32 zero = 0;
+
+    // Get fd from scratch space
+    int *fd_ptr = bpf_map_lookup_elem(&scratch_fd, &zero);
+    if (!fd_ptr) return 0;
+    int fd = *fd_ptr;
+
+    // Look up connection state
+    struct conn_key_t key = { .pid = pid, .fd = fd };
+    struct conn_state_t *state = bpf_map_lookup_elem(&active_conns, &key);
+    if (!state) return 0;
+
+    u64 now = bpf_ktime_get_ns();
+
+    // Update packet tracking
+    if (state->first_pkt_ns == 0) {
+        state->first_pkt_ns = now;
+    }
+    state->last_pkt_ns = now;
+    state->pkts_recv++;
+
+    return 0;
+}
+
+// ============================================================================
+// TRACEPOINT: sys_enter_close - Capture fd for close tracking
+// ============================================================================
+
+SEC("tracepoint/syscalls/sys_enter_close")
+int trace_enter_close(struct trace_event_raw_sys_enter *ctx) {
+    // ctx->args[0] = fd
+    int fd = (int)ctx->args[0];
+    u32 zero = 0;
+    bpf_map_update_elem(&scratch_fd, &zero, &fd, BPF_ANY);
+    return 0;
+}
+
+// ============================================================================
+// TRACEPOINT: sys_exit_close - Emit close event with final stats
+// ============================================================================
+
+SEC("tracepoint/syscalls/sys_exit_close")
+int trace_exit_close(struct trace_event_raw_sys_exit *ctx) {
+    // ctx->ret = 0 on success, negative on error
+    // We emit close event regardless of success/failure
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u32 zero = 0;
+
+    // Get fd from scratch space
+    int *fd_ptr = bpf_map_lookup_elem(&scratch_fd, &zero);
+    if (!fd_ptr) return 0;
+    int fd = *fd_ptr;
+
+    // Look up connection state
+    struct conn_key_t key = { .pid = pid, .fd = fd };
+    struct conn_state_t *state = bpf_map_lookup_elem(&active_conns, &key);
+    if (!state) return 0;
+
+    // Only emit if there was actual packet traffic
+    if (state->pkts_sent > 0 || state->pkts_recv > 0) {
+        struct close_event_t *e = bpf_ringbuf_reserve(&close_events, sizeof(*e), 0);
+        if (e) {
+            e->pid           = pid;
+            e->start_ns      = state->start_ns;
+            e->first_pkt_ns  = state->first_pkt_ns;
+            e->last_pkt_ns   = state->last_pkt_ns;
+            e->pkts_sent     = state->pkts_sent;
+            e->pkts_recv     = state->pkts_recv;
+            e->dest_ip       = state->dest_ip;
+            e->dest_port     = state->dest_port;
+            e->family        = state->family;
+            e->protocol      = state->protocol;
+
+            // Copy IPv6 address
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                e->dest_ip6[i] = state->dest_ip6[i];
+            }
+
+            bpf_ringbuf_submit(e, 0);
+        }
+    }
+
+    // Remove connection from tracking
+    bpf_map_delete_elem(&active_conns, &key);
     return 0;
 }

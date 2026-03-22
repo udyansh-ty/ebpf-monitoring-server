@@ -116,10 +116,42 @@ func (p *Program) Attach(ctx context.Context) error {
 		return fmt.Errorf("failed to attach to tracepoint: %w", err)
 	}
 
-	// Start ring buffer reader
+	// Attach to write syscalls for packet tracking
+	if err := p.AttachToTracepoint("trace_enter_write", "syscalls", "sys_enter_write"); err != nil {
+		logger.Warnf("Failed to attach to sys_enter_write: %v", err)
+		// Don't fail completely, continue with other tracepoints
+	}
+	if err := p.AttachToTracepoint("trace_exit_write", "syscalls", "sys_exit_write"); err != nil {
+		logger.Warnf("Failed to attach to sys_exit_write: %v", err)
+	}
+
+	// Attach to read syscalls for packet tracking
+	if err := p.AttachToTracepoint("trace_enter_read", "syscalls", "sys_enter_read"); err != nil {
+		logger.Warnf("Failed to attach to sys_enter_read: %v", err)
+	}
+	if err := p.AttachToTracepoint("trace_exit_read", "syscalls", "sys_exit_read"); err != nil {
+		logger.Warnf("Failed to attach to sys_exit_read: %v", err)
+	}
+
+	// Attach to close syscalls for connection finalization
+	if err := p.AttachToTracepoint("trace_enter_close", "syscalls", "sys_enter_close"); err != nil {
+		logger.Warnf("Failed to attach to sys_enter_close: %v", err)
+	}
+	if err := p.AttachToTracepoint("trace_exit_close", "syscalls", "sys_exit_close"); err != nil {
+		logger.Warnf("Failed to attach to sys_exit_close: %v", err)
+	}
+
+	// Start ring buffer reader for connect events
 	parser := NewEventParser()
 	if err := p.StartRingBufferReader(EventsMapName, parser); err != nil {
-		return fmt.Errorf("failed to start ring buffer reader: %w", err)
+		return fmt.Errorf("failed to start ring buffer reader for events: %w", err)
+	}
+
+	// Start ring buffer reader for close events
+	closeParser := &CloseEventParser{}
+	if err := p.StartRingBufferReader("close_events", closeParser); err != nil {
+		logger.Warnf("Failed to start ring buffer reader for close_events: %v", err)
+		// Don't fail completely - close event tracking is optional
 	}
 
 	logger.Info("Connection monitoring program attached and active")
