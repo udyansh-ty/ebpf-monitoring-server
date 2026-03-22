@@ -893,16 +893,24 @@ func resolveInterfaceIPv4(destIP string) string {
 		destStr := fields[1]
 		maskStr := fields[7]
 
-		// Parse destination and mask as hex
-		dest, errD := strconv.ParseUint(destStr, 16, 32)
-		mask, errM := strconv.ParseUint(maskStr, 16, 32)
+		// Parse destination and mask as hex strings
+		// In /proc/net/route, IPs are stored in little-endian byte order
+		destBytes := make([]byte, 4)
+		maskBytes := make([]byte, 4)
 
-		if errD != nil || errM != nil {
+		if _, errD := hex.Decode(destBytes, []byte(destStr)); errD != nil {
+			continue
+		}
+		if _, errM := hex.Decode(maskBytes, []byte(maskStr)); errM != nil {
 			continue
 		}
 
+		// Convert little-endian bytes to uint32
+		dest := uint32(destBytes[0]) | (uint32(destBytes[1]) << 8) | (uint32(destBytes[2]) << 16) | (uint32(destBytes[3]) << 24)
+		mask := uint32(maskBytes[0]) | (uint32(maskBytes[1]) << 8) | (uint32(maskBytes[2]) << 16) | (uint32(maskBytes[3]) << 24)
+
 		// Check if destination IP matches this route
-		if (destIPUint & uint32(mask)) == uint32(dest) {
+		if (destIPUint & mask) == dest {
 			// Count set bits in mask (highest prefix length wins - most specific route)
 			maskBits := bits.OnesCount32(uint32(mask))
 
