@@ -841,8 +841,12 @@ func resolveInterfaceFromRoute(destIP string) string {
 	return iface
 }
 
-// resolveInterfaceIPv4 finds the interface for an IPv4 destination
+// resolveInterfaceIPv4 finds the interface for an IPv4 destination by parsing /proc/net/route
 func resolveInterfaceIPv4(destIP string) string {
+	if destIP == "" {
+		return ""
+	}
+
 	file, err := os.Open("/proc/net/route")
 	if err != nil {
 		logger.Debugf("Failed to open /proc/net/route: %v", err)
@@ -851,79 +855,80 @@ func resolveInterfaceIPv4(destIP string) string {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	// Skip header
+	// Skip header line
 	if !scanner.Scan() {
-		logger.Debugf("Failed to read header from /proc/net/route")
+		logger.Debugf("Failed to read /proc/net/route header")
 		return ""
 	}
 
-	destIPParsed := net.ParseIP(destIP).To4()
-	if destIPParsed == nil {
-		logger.Debugf("Invalid IPv4 address for route lookup: %s", destIP)
+	destIPBytes := net.ParseIP(destIP)
+	if destIPBytes == nil {
+		logger.Debugf("Invalid destination IP: %s", destIP)
 		return ""
 	}
 
-	// Convert destination IP to uint32 for comparison (in network byte order as stored in route table)
-	destIPUint := uint32(destIPParsed[0]) | (uint32(destIPParsed[1]) << 8) | (uint32(destIPParsed[2]) << 16) | (uint32(destIPParsed[3]) << 24)
+	destIPv4 := destIPBytes.To4()
+	if destIPv4 == nil {
+		logger.Debugf("Not an IPv4 address: %s", destIP)
+		return ""
+	}
+
+	// Convert to uint32 in little-endian format (as stored in /proc/net/route)
+	destIPUint := uint32(destIPv4[0]) | (uint32(destIPv4[1]) << 8) | (uint32(destIPv4[2]) << 16) | (uint32(destIPv4[3]) << 24)
 
 	var bestMatch string
 	var bestMaskLen int
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
 		fields := strings.Fields(line)
-		// /proc/net/route format: Iface Destination Gateway Flags RefCnt Use Metric Mask
+
+		// /proc/net/route format: Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+		// We need at least Iface(0), Destination(1), and Mask(7)
 		if len(fields) < 8 {
 			continue
 		}
 
 		iface := fields[0]
-		destField := fields[1]
-		maskField := fields[7]
+		destStr := fields[1]
+		maskStr := fields[7]
 
-		// Parse destination (little-endian hex)
-		destVal, err := strconv.ParseUint(destField, 16, 32)
-		if err != nil {
-			logger.Debugf("Failed to parse IPv4 route destination: %s, error: %v", destField, err)
+		// Parse destination and mask as hex
+		dest, errD := strconv.ParseUint(destStr, 16, 32)
+		mask, errM := strconv.ParseUint(maskStr, 16, 32)
+
+		if errD != nil || errM != nil {
 			continue
 		}
 
-		// Parse mask (little-endian hex)
-		maskVal, err := strconv.ParseUint(maskField, 16, 32)
-		if err != nil {
-			logger.Debugf("Failed to parse IPv4 route mask: %s, error: %v", maskField, err)
-			continue
-		}
+		// Check if destination IP matches this route
+		if (destIPUint & uint32(mask)) == uint32(dest) {
+			// Count set bits in mask (highest prefix length wins - most specific route)
+			maskBits := bits.OnesCount32(uint32(mask))
 
-		// Check if destination matches this route
-		if (destIPUint & uint32(maskVal)) == uint32(destVal) {
-			// Count bits in mask to find most specific route
-			maskLen := bits.OnesCount32(uint32(maskVal))
-			if maskLen > bestMaskLen {
-				bestMaskLen = maskLen
+			if maskBits > bestMaskLen {
+				bestMaskLen = maskBits
 				bestMatch = iface
-				logger.Debugf("Found IPv4 route match for %s: iface=%s mask_bits=%d", destIP, iface, maskLen)
+				logger.Debugf("✓ IPv4 route match: %s -> %s (mask bits: %d)", destIP, iface, maskBits)
 			}
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		logger.Debugf("Error reading route table: %v", err)
-	}
-
 	if bestMatch == "" {
-		logger.Debugf("No IPv4 route found for %s", destIP)
+		logger.Debugf("✗ No IPv4 route found for: %s", destIP)
+		return ""
 	}
 
+	logger.Debugf("✓ Resolved IPv4 interface for %s: %s", destIP, bestMatch)
 	return bestMatch
 }
 
 // resolveInterfaceIPv6 finds the interface for an IPv6 destination
 func resolveInterfaceIPv6(destIP string) string {
+	if destIP == "" {
+		return ""
+	}
+
 	file, err := os.Open("/proc/net/ipv6_route")
 	if err != nil {
 		logger.Debugf("Failed to open /proc/net/ipv6_route: %v", err)
@@ -931,90 +936,80 @@ func resolveInterfaceIPv6(destIP string) string {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-
 	destIPParsed := net.ParseIP(destIP)
-	if destIPParsed == nil || destIPParsed.To4() != nil {
-		logger.Debugf("Invalid IPv6 address for route lookup: %s", destIP)
+	if destIPParsed == nil {
+		logger.Debugf("Invalid destination IP: %s", destIP)
 		return ""
 	}
 
+	if destIPParsed.To4() != nil {
+		logger.Debugf("Not an IPv6 address: %s", destIP)
+		return ""
+	}
+
+	scanner := bufio.NewScanner(file)
 	var bestMatch string
 	var bestPrefixLen int
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
 		fields := strings.Fields(line)
+
 		// /proc/net/ipv6_route format:
-		// destination metric next_hop flags refcnt use metric iface
-		// Fields: 0=dest, 1=destprefix, 2=nexthop, 3=metric, 4=use, 5=flags, 6=refcnt, 7=use, 8=metric, 9=iface
+		// destination prefix_len nexthop metric use flags refcnt use metric interface
+		// Index:   0           1       2        3      4   5     6      7   8      9
 		if len(fields) < 10 {
-			logger.Debugf("IPv6 route line has too few fields: %d", len(fields))
 			continue
 		}
 
-		destField := fields[0]
-		prefixField := fields[1]
+		destHex := fields[0]
+		prefixStr := fields[1]
 		iface := fields[9]
 
-		// Skip invalid interface names
-		if iface == "" || strings.Contains(iface, ":") {
-			continue
-		}
-
-		// Parse prefix length (it's in hex in the file)
-		prefixLen, err := strconv.ParseInt(prefixField, 16, 8)
+		// Parse prefix length (in hex)
+		prefixLen, err := strconv.ParseInt(prefixStr, 16, 8)
 		if err != nil {
-			logger.Debugf("Failed to parse IPv6 prefix: %s, error: %v", prefixField, err)
 			continue
 		}
 
-		// Parse destination IPv6 address
-		routeIPStr := convertIPv6HexToString(destField)
-		if routeIPStr == "" {
-			logger.Debugf("Failed to convert IPv6 hex to string: %s", destField)
+		// Convert hex IP to standard format
+		routeIP := convertIPv6HexToString(destHex)
+		if routeIP == "" {
 			continue
 		}
 
-		routeIP := net.ParseIP(routeIPStr)
-		if routeIP == nil {
-			logger.Debugf("Failed to parse route IP: %s (from hex: %s)", routeIPStr, destField)
+		routeIPParsed := net.ParseIP(routeIP)
+		if routeIPParsed == nil {
 			continue
 		}
 
-		// Check if destination matches this route using CIDR matching
-		if matchesIPv6Route(destIPParsed, routeIP, int(prefixLen)) {
+		// Check if destination matches using CIDR mask
+		mask := net.CIDRMask(int(prefixLen), 128)
+		if mask == nil {
+			continue
+		}
+
+		if destIPParsed.Mask(mask).Equal(routeIPParsed.Mask(mask)) {
+			// Keep most specific route (highest prefix length)
 			if int(prefixLen) > bestPrefixLen {
 				bestPrefixLen = int(prefixLen)
 				bestMatch = iface
-				logger.Debugf("Found IPv6 route match for %s: iface=%s prefix=%d", destIP, iface, prefixLen)
+				logger.Debugf("✓ IPv6 route match: %s -> %s (prefix: %d)", destIP, iface, prefixLen)
 			}
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		logger.Debugf("Error reading ipv6_route: %v", err)
-	}
-
 	if bestMatch == "" {
-		logger.Debugf("No IPv6 route found for %s", destIP)
+		logger.Debugf("✗ No IPv6 route found for: %s", destIP)
+		return ""
 	}
 
+	logger.Debugf("✓ Resolved IPv6 interface for %s: %s", destIP, bestMatch)
 	return bestMatch
 }
 
-// matchesIPv6Route checks if an IP matches a route with given prefix length
-func matchesIPv6Route(destIP net.IP, routeIP net.IP, prefixLen int) bool {
-	mask := net.CIDRMask(prefixLen, 128)
-	return destIP.Mask(mask).Equal(routeIP.Mask(mask))
-}
-
 // convertIPv6HexToString converts IPv6 address in hex format from /proc/net/ipv6_route
-// Format: 8 groups of 4 hex digits (each 16-bit group)
+// Format: 8 groups of 4 hex digits
 func convertIPv6HexToString(hexStr string) string {
 	if len(hexStr) != 32 {
 		return ""
