@@ -236,6 +236,11 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 		}
 	}
 
+	// Enrich with connection lifecycle data (packets, active_seconds)
+	// Convert timestamp to time.Time for lifecycle calculation
+	wallClockTime := time.Unix(0, int64(timestamp))
+	enrichEventWithLifecycleData(metadata, sourceIP, sourcePort, destinationIP, destPort, family, wallClockTime)
+
 	event := events.NewBaseEvent("connection", pid, command, timestamp, metadata)
 
 	// Debug log the parsed connection event
