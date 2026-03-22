@@ -61,6 +61,69 @@ struct {
     __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
+// ============================================================================
+// CONNECTION LIFECYCLE TRACKING - Track packets and connection duration
+// ============================================================================
+
+// Key to identify a connection: (pid, file descriptor)
+struct conn_key_t {
+    u32 pid;
+    int fd;
+} __attribute__((packed));
+
+// State tracked for each active connection
+struct conn_state_t {
+    u64 start_ns;        // When connect() was called
+    u64 first_pkt_ns;    // When first packet was sent/received
+    u64 last_pkt_ns;     // When last packet was sent/received
+    u64 pkts_sent;       // Count of write/sendmsg calls
+    u64 pkts_recv;       // Count of read/recvmsg calls
+    u32 dest_ip;         // Destination IPv4
+    u8  dest_ip6[16];    // Destination IPv6
+    u16 dest_port;       // Destination port
+    u16 family;          // AF_INET or AF_INET6
+    u8  protocol;        // IPPROTO_TCP or IPPROTO_UDP
+    u8  pad[7];          // Alignment padding
+} __attribute__((packed));
+
+// Map to track active connections: (pid, fd) -> connection state
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct conn_key_t);
+    __type(value, struct conn_state_t);
+} active_conns SEC(".maps");
+
+// Per-CPU scratch space to pass fd from sys_enter_* to sys_exit_*
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, int);
+} scratch_fd SEC(".maps");
+
+// Event structure for connection close with complete stats
+struct close_event_t {
+    u32 pid;             // Process ID
+    u64 start_ns;        // When connection was established
+    u64 first_pkt_ns;    // When first packet was sent/received
+    u64 last_pkt_ns;     // When last packet was sent/received
+    u64 pkts_sent;       // Number of packets sent
+    u64 pkts_recv;       // Number of packets received
+    u32 dest_ip;         // Destination IPv4
+    u8  dest_ip6[16];    // Destination IPv6
+    u16 dest_port;       // Destination port
+    u16 family;          // Address family
+    u8  protocol;        // Protocol type
+    u8  pad[1];          // Alignment
+} __attribute__((packed));
+
+// Ring buffer for close events (4MB)
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 22);
+} close_events SEC(".maps");
+
 SEC("tracepoint/syscalls/sys_enter_connect")
 int trace_connect(struct trace_event_raw_sys_enter *ctx) {
     struct event_t *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -230,73 +293,10 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx) {
 }
 
 // ============================================================================
-// CONNECTION LIFECYCLE TRACKING - Track packets and connection duration
-// ============================================================================
-
-// Key to identify a connection: (pid, file descriptor)
-struct conn_key_t {
-    u32 pid;
-    int fd;
-} __attribute__((packed));
-
-// State tracked for each active connection
-struct conn_state_t {
-    u64 start_ns;        // When connect() was called
-    u64 first_pkt_ns;    // When first packet was sent/received
-    u64 last_pkt_ns;     // When last packet was sent/received
-    u64 pkts_sent;       // Count of write/sendmsg calls
-    u64 pkts_recv;       // Count of read/recvmsg calls
-    u32 dest_ip;         // Destination IPv4
-    u8  dest_ip6[16];    // Destination IPv6
-    u16 dest_port;       // Destination port
-    u16 family;          // AF_INET or AF_INET6
-    u8  protocol;        // IPPROTO_TCP or IPPROTO_UDP
-    u8  pad[7];          // Alignment padding
-} __attribute__((packed));
-
-// Map to track active connections: (pid, fd) -> connection state
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct conn_key_t);
-    __type(value, struct conn_state_t);
-} active_conns SEC(".maps");
-
-// Per-CPU scratch space to pass fd from sys_enter_* to sys_exit_*
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, int);
-} scratch_fd SEC(".maps");
-
-// Event structure for connection close with complete stats
-struct close_event_t {
-    u32 pid;             // Process ID
-    u64 start_ns;        // When connection was established
-    u64 first_pkt_ns;    // When first packet was sent/received
-    u64 last_pkt_ns;     // When last packet was sent/received
-    u64 pkts_sent;       // Number of packets sent
-    u64 pkts_recv;       // Number of packets received
-    u32 dest_ip;         // Destination IPv4
-    u8  dest_ip6[16];    // Destination IPv6
-    u16 dest_port;       // Destination port
-    u16 family;          // Address family
-    u8  protocol;        // Protocol type
-    u8  pad[1];          // Alignment
-} __attribute__((packed));
-
-// Ring buffer for close events (4MB)
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 22);
-} close_events SEC(".maps");
-
-// ============================================================================
 // TRACEPOINT: sys_enter_connect - Store connection state
 // ============================================================================
 
-// Note: trace_connect is already defined above, but we'll add map population
+// Note: trace_connect is already defined above
 
 // ============================================================================
 // TRACEPOINT: sys_enter_write - Capture fd for write tracking
