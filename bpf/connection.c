@@ -124,12 +124,6 @@ struct {
     __uint(max_entries, 1 << 22);
 } close_events SEC(".maps");
 
-// Generic struct for syscall exit events - access return value from tracepoint
-struct sys_exit_event {
-    unsigned short __data_loc_name;
-    int syscall_nr;
-    long ret;
-} __attribute__((packed));
 
 SEC("tracepoint/syscalls/sys_enter_connect")
 int trace_connect(struct trace_event_raw_sys_enter *ctx) {
@@ -324,9 +318,8 @@ int trace_enter_write(struct trace_event_raw_sys_enter *ctx) {
 // ============================================================================
 
 SEC("tracepoint/syscalls/sys_exit_write")
-int trace_exit_write(struct sys_exit_event *ctx) {
-    // ctx->ret = number of bytes written (or negative error code)
-    if (ctx->ret <= 0) return 0;
+int trace_exit_write(struct trace_event_raw_sys_exit *ctx) {
+    // Track write syscall exits - update packet tracking
 
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     u32 zero = 0;
@@ -371,9 +364,8 @@ int trace_enter_read(struct trace_event_raw_sys_enter *ctx) {
 // ============================================================================
 
 SEC("tracepoint/syscalls/sys_exit_read")
-int trace_exit_read(struct sys_exit_event *ctx) {
-    // ctx->ret = number of bytes read (or negative error code)
-    if (ctx->ret <= 0) return 0;
+int trace_exit_read(struct trace_event_raw_sys_exit *ctx) {
+    // Track read syscall exits - update packet tracking
 
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     u32 zero = 0;
@@ -418,9 +410,9 @@ int trace_enter_close(struct trace_event_raw_sys_enter *ctx) {
 // ============================================================================
 
 SEC("tracepoint/syscalls/sys_exit_close")
-int trace_exit_close(struct sys_exit_event *ctx) {
-    // ctx->ret = 0 on success, negative on error
-    // We emit close event regardless of success/failure
+int trace_exit_close(struct trace_event_raw_sys_exit *ctx) {
+    // Emit close event to finalize connection tracking
+    // We capture at sys_exit regardless of success/failure
 
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     u32 zero = 0;
