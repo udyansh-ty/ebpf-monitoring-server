@@ -2,10 +2,16 @@
 package connection
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"math/bits"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,11 +28,17 @@ const (
 )
 
 const (
+	protoTCP = 6
+	protoUDP = 17
+)
+
+const (
 	sourceIPCacheTTL   = 30 * time.Second
 	rdnsLookupTimeout  = 200 * time.Millisecond
 	rdnsCacheTTL       = 10 * time.Minute
 	rdnsFailureCacheTT = 2 * time.Minute
 	rdnsCacheMaxKeys   = 4096
+	sourcePortCacheTTL = 30 * time.Second
 )
 
 type sourceIPCacheEntry struct {
@@ -40,12 +52,27 @@ type rdnsCacheEntry struct {
 	TTL       time.Duration
 }
 
+type sourcePortCacheKey struct {
+	PID      uint32
+	DestIP   string
+	DestPort uint16
+	Protocol uint8
+}
+
+type sourcePortCacheEntry struct {
+	Port      uint16
+	UpdatedAt time.Time
+}
+
 var (
 	sourceIPCacheMu sync.RWMutex
 	sourceIPCache   = map[uint16]sourceIPCacheEntry{}
 
 	rdnsCacheMu sync.RWMutex
 	rdnsCache   = map[string]rdnsCacheEntry{}
+
+	sourcePortCacheMu sync.RWMutex
+	sourcePortCache   = map[sourcePortCacheKey]sourcePortCacheEntry{}
 )
 
 const (
@@ -177,6 +204,21 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 		"raw_protocol": protocol,
 		"raw_socktype": sockType,
 	}
+
+	// Resolve source port with improved method
+	sourcePort := resolveSourcePort(pid, family, destinationIP, destPort, protocol)
+	if sourcePort != 0 {
+		metadata["source_port"] = sourcePort
+		metadata["src_port"] = sourcePort
+	} else {
+		// Fallback: try direct socket lookup
+		sourcePort = findSourcePortDirect(pid, destinationIP, destPort, protocol)
+		if sourcePort != 0 {
+			metadata["source_port"] = sourcePort
+			metadata["src_port"] = sourcePort
+		}
+	}
+
 	if sourceIP != "" {
 		metadata["source_ip"] = sourceIP
 		metadata["src_ip"] = sourceIP
@@ -184,6 +226,14 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 	if serverName != "" {
 		metadata["server_name"] = serverName
 		metadata["sni"] = serverName
+	}
+
+	// Resolve network interface from routing table
+	if destinationIP != "" {
+		iface := resolveInterfaceFromRoute(destinationIP)
+		if iface != "" {
+			metadata["interface_name"] = iface
+		}
 	}
 
 	event := events.NewBaseEvent("connection", pid, command, timestamp, metadata)
@@ -433,4 +483,421 @@ func cacheRDNSResult(ip, value string, ttl time.Duration) {
 		UpdatedAt: time.Now(),
 		TTL:       ttl,
 	}
+}
+
+func resolveSourcePort(pid uint32, family uint16, destinationIP string, destinationPort uint16, protocol uint8) uint16 {
+	destIP := strings.TrimSpace(destinationIP)
+	if pid == 0 || destIP == "" || destinationPort == 0 {
+		return 0
+	}
+	if protocol != protoTCP && protocol != protoUDP {
+		return 0
+	}
+
+	cacheKey := sourcePortCacheKey{
+		PID:      pid,
+		DestIP:   destIP,
+		DestPort: destinationPort,
+		Protocol: protocol,
+	}
+
+	now := time.Now()
+	sourcePortCacheMu.RLock()
+	if cached, ok := sourcePortCache[cacheKey]; ok && now.Sub(cached.UpdatedAt) <= sourcePortCacheTTL {
+		sourcePortCacheMu.RUnlock()
+		return cached.Port
+	}
+	sourcePortCacheMu.RUnlock()
+
+	inodes := getProcessSocketInodes(pid)
+	if len(inodes) == 0 {
+		return 0
+	}
+
+	isIPv6 := family == afInet6 || strings.Contains(destIP, ":")
+	port := findLocalPortByRemote(inodes, destIP, destinationPort, protocol, isIPv6)
+	if port == 0 {
+		return 0
+	}
+
+	sourcePortCacheMu.Lock()
+	sourcePortCache[cacheKey] = sourcePortCacheEntry{
+		Port:      port,
+		UpdatedAt: now,
+	}
+	sourcePortCacheMu.Unlock()
+
+	return port
+}
+
+func getProcessSocketInodes(pid uint32) map[uint64]struct{} {
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil
+	}
+
+	inodes := make(map[uint64]struct{})
+	for _, entry := range entries {
+		if len(inodes) >= 2048 {
+			break
+		}
+		link, err := os.Readlink(filepath.Join(fdDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		if !strings.HasPrefix(link, "socket:[") {
+			continue
+		}
+		start := strings.IndexByte(link, '[')
+		end := strings.IndexByte(link, ']')
+		if start == -1 || end == -1 || end <= start+1 {
+			continue
+		}
+		inodeStr := link[start+1 : end]
+		inode, err := strconv.ParseUint(inodeStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		inodes[inode] = struct{}{}
+	}
+
+	return inodes
+}
+
+func findLocalPortByRemote(inodes map[uint64]struct{}, destIP string, destPort uint16, protocol uint8, isIPv6 bool) uint16 {
+	remoteIP := net.ParseIP(destIP)
+	if remoteIP == nil {
+		return 0
+	}
+
+	procFile := "/proc/net/tcp"
+	if protocol == protoUDP {
+		procFile = "/proc/net/udp"
+	}
+	if isIPv6 {
+		procFile += "6"
+	}
+
+	file, err := os.Open(procFile)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	// Skip header
+	if !scanner.Scan() {
+		return 0
+	}
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 4 {
+			continue
+		}
+		localAddr := fields[1]
+		remoteAddr := fields[2]
+		inodeStr := fields[len(fields)-1]
+
+		inode, err := strconv.ParseUint(inodeStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		if _, ok := inodes[inode]; !ok {
+			continue
+		}
+
+		remoteParsedIP, remoteParsedPort, ok := parseProcNetAddr(remoteAddr)
+		if !ok {
+			continue
+		}
+		if !remoteParsedIP.Equal(remoteIP) || remoteParsedPort != destPort {
+			continue
+		}
+
+		_, localPort, ok := parseProcNetAddr(localAddr)
+		if !ok {
+			continue
+		}
+		return localPort
+	}
+
+	return 0
+}
+
+func parseProcNetAddr(addr string) (net.IP, uint16, bool) {
+	parts := strings.Split(addr, ":")
+	if len(parts) != 2 {
+		return nil, 0, false
+	}
+	ipHex := parts[0]
+	portHex := parts[1]
+
+	portVal, err := strconv.ParseUint(portHex, 16, 16)
+	if err != nil {
+		return nil, 0, false
+	}
+
+	switch len(ipHex) {
+	case 8:
+		val, err := strconv.ParseUint(ipHex, 16, 32)
+		if err != nil {
+			return nil, 0, false
+		}
+		ip := net.IPv4(
+			byte(val&0xff),
+			byte((val>>8)&0xff),
+			byte((val>>16)&0xff),
+			byte((val>>24)&0xff),
+		)
+		return ip, uint16(portVal), true
+	case 32:
+		raw, err := hex.DecodeString(ipHex)
+		if err != nil || len(raw) != 16 {
+			return nil, 0, false
+		}
+		// /proc/net/tcp6 stores IPv6 in little-endian 32-bit words.
+		for i := 0; i < 16; i += 4 {
+			raw[i], raw[i+1], raw[i+2], raw[i+3] = raw[i+3], raw[i+2], raw[i+1], raw[i]
+		}
+		return net.IP(raw), uint16(portVal), true
+	default:
+		return nil, 0, false
+	}
+}
+
+// findSourcePortDirect performs a direct lookup of source port from /proc/net/tcp[6]
+// by scanning all entries for a matching destination address and port.
+// This is a fallback when inode-based matching fails.
+func findSourcePortDirect(pid uint32, destIP string, destPort uint16, protocol uint8) uint16 {
+	if pid == 0 || destIP == "" || destPort == 0 {
+		return 0
+	}
+
+	procFile := "/proc/net/tcp"
+	if protocol == protoUDP {
+		procFile = "/proc/net/udp"
+	}
+	if strings.Contains(destIP, ":") {
+		procFile += "6"
+	}
+
+	file, err := os.Open(procFile)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	// Skip header
+	if !scanner.Scan() {
+		return 0
+	}
+
+	remoteIP := net.ParseIP(destIP)
+	if remoteIP == nil {
+		return 0
+	}
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+
+		localAddr := fields[1]
+		remoteAddr := fields[2]
+
+		// Parse remote address
+		remoteParsedIP, remoteParsedPort, ok := parseProcNetAddr(remoteAddr)
+		if !ok {
+			continue
+		}
+
+		// Check if destination matches
+		if !remoteParsedIP.Equal(remoteIP) || remoteParsedPort != destPort {
+			continue
+		}
+
+		// Found matching entry, extract local port
+		_, localPort, ok := parseProcNetAddr(localAddr)
+		if !ok {
+			continue
+		}
+
+		return localPort
+	}
+
+	return 0
+}
+
+// resolveInterfaceFromRoute determines the network interface for a destination IP
+// by querying the routing table via /proc/net/route or /proc/net/ipv6_route
+func resolveInterfaceFromRoute(destIP string) string {
+	if destIP == "" {
+		return ""
+	}
+
+	ip := net.ParseIP(destIP)
+	if ip == nil {
+		return ""
+	}
+
+	// Check if IPv4 or IPv6
+	if ip.To4() != nil {
+		return resolveInterfaceIPv4(ip.String())
+	}
+	return resolveInterfaceIPv6(ip.String())
+}
+
+// resolveInterfaceIPv4 finds the interface for an IPv4 destination
+func resolveInterfaceIPv4(destIP string) string {
+	file, err := os.Open("/proc/net/route")
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	// Skip header
+	if !scanner.Scan() {
+		return ""
+	}
+
+	destIPParsed := net.ParseIP(destIP).To4()
+	if destIPParsed == nil {
+		return ""
+	}
+
+	// Convert destination IP to uint32 for comparison
+	destIPUint := uint32(destIPParsed[0]) | (uint32(destIPParsed[1]) << 8) | (uint32(destIPParsed[2]) << 16) | (uint32(destIPParsed[3]) << 24)
+
+	var bestMatch string
+	var bestMaskLen int
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+
+		iface := fields[0]
+		destField := fields[1]
+		maskField := fields[2]
+
+		// Parse destination (little-endian hex)
+		destVal, err := strconv.ParseUint(destField, 16, 32)
+		if err != nil {
+			continue
+		}
+
+		// Parse mask (little-endian hex)
+		maskVal, err := strconv.ParseUint(maskField, 16, 32)
+		if err != nil {
+			continue
+		}
+
+		// Check if destination matches this route
+		if (destIPUint & uint32(maskVal)) == uint32(destVal) {
+			// Count bits in mask to find most specific route
+			maskLen := bits.OnesCount32(uint32(maskVal))
+			if maskLen > bestMaskLen {
+				bestMaskLen = maskLen
+				bestMatch = iface
+			}
+		}
+	}
+
+	return bestMatch
+}
+
+// resolveInterfaceIPv6 finds the interface for an IPv6 destination
+func resolveInterfaceIPv6(destIP string) string {
+	file, err := os.Open("/proc/net/ipv6_route")
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	destIPParsed := net.ParseIP(destIP)
+	if destIPParsed == nil || destIPParsed.To4() != nil {
+		return ""
+	}
+
+	var bestMatch string
+	var bestPrefixLen int
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+
+		destField := fields[0]
+		prefixField := fields[1]
+		iface := fields[9]
+
+		// Parse prefix length
+		prefixLen, err := strconv.ParseInt(prefixField, 16, 8)
+		if err != nil {
+			continue
+		}
+
+		// Parse destination IPv6 address
+		routeIPStr := convertIPv6HexToString(destField)
+		if routeIPStr == "" {
+			continue
+		}
+
+		routeIP := net.ParseIP(routeIPStr)
+		if routeIP == nil {
+			continue
+		}
+
+		// Check if destination matches this route
+		ones, bits := net.IPNet{IP: routeIP, Mask: net.CIDRMask(int(prefixLen), 128)}.Mask.Size()
+		if bits == 128 && matchesIPv6Route(destIPParsed, routeIP, int(prefixLen)) {
+			if ones > bestPrefixLen {
+				bestPrefixLen = ones
+				bestMatch = iface
+			}
+		}
+	}
+
+	return bestMatch
+}
+
+// matchesIPv6Route checks if an IP matches a route with given prefix length
+func matchesIPv6Route(destIP net.IP, routeIP net.IP, prefixLen int) bool {
+	mask := net.CIDRMask(prefixLen, 128)
+	return destIP.Mask(mask).Equal(routeIP.Mask(mask))
+}
+
+// convertIPv6HexToString converts IPv6 address in hex format from /proc/net/ipv6_route
+// Format: 8 groups of 4 hex digits (each 16-bit group)
+func convertIPv6HexToString(hexStr string) string {
+	if len(hexStr) != 32 {
+		return ""
+	}
+
+	var parts []string
+	for i := 0; i < 8; i++ {
+		group := hexStr[i*4 : (i+1)*4]
+		val, err := strconv.ParseUint(group, 16, 16)
+		if err != nil {
+			return ""
+		}
+		parts = append(parts, fmt.Sprintf("%04x", val))
+	}
+
+	ipStr := strings.Join(parts, ":")
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ""
+	}
+
+	return ip.String()
 }
