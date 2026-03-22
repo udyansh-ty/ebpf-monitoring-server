@@ -237,9 +237,11 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 	}
 
 	// Enrich with connection lifecycle data (packets, active_seconds)
-	// Convert timestamp to time.Time for lifecycle calculation
-	wallClockTime := time.Unix(0, int64(timestamp))
-	enrichEventWithLifecycleData(metadata, sourceIP, sourcePort, destinationIP, destPort, family, wallClockTime)
+	// Use current time since the event was just captured
+	// Note: sourcePort may be 0 if resolution failed, in which case we can't match in /proc/net/tcp
+	if sourcePort != 0 {  // Only enrich if we have valid source port
+		enrichEventWithLifecycleData(metadata, sourceIP, sourcePort, destinationIP, destPort, family, time.Now())
+	}
 
 	event := events.NewBaseEvent("connection", pid, command, timestamp, metadata)
 
