@@ -2,7 +2,6 @@ package connection
 
 import (
 	"encoding/binary"
-	"net"
 
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/internal/events"
