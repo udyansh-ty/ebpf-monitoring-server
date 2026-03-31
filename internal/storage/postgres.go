@@ -120,33 +120,6 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 	return nil
 }
 
-// DeleteMetaWindowOlderThan removes aggregate rows older than the provided window size.
-func (s *PostgreSQLStorage) DeleteMetaWindowOlderThan(ctx context.Context, keepWindowSeconds int64) (int64, error) {
-	if keepWindowSeconds <= 0 {
-		return 0, nil
-	}
-
-	logger.Infof("[DB] Deleting ebpf_meta_window rows older than %d seconds", keepWindowSeconds)
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sql := `
-		DELETE FROM ebpf_meta_window
-		WHERE bucket_epoch < (EXTRACT(EPOCH FROM now())::bigint - $1)
-	`
-
-	tag, err := s.pool.Exec(ctx, sql, keepWindowSeconds)
-	if err != nil {
-		logger.Errorf("[DB] DeleteMetaWindowOlderThan failed: %v", err)
-		return 0, fmt.Errorf("failed to apply ebpf_meta_window retention (window=%ds): %w", keepWindowSeconds, err)
-	}
-
-	rowsDeleted := tag.RowsAffected()
-	logger.Infof("[DB] Deleted %d rows from ebpf_meta_window (window=%ds)", rowsDeleted, keepWindowSeconds)
-	return rowsDeleted, nil
-}
-
 // NewPostgreSQLStorage creates a new PostgreSQL-backed event storage.
 // connStr should be a PostgreSQL connection string (e.g., "postgres://user:pass@localhost/dbname").
 // ANCHOR: Event Storage Initialization - Feb 3, 2026

@@ -13,6 +13,7 @@ AGGREGATOR_NAME := ebpf-aggregator
 BPF_SOURCES := $(wildcard bpf/*.c)
 BPF_OBJECTS := $(BPF_SOURCES:.c=.o)
 GO_SOURCES := $(shell find . -name '*.go' -not -path './vendor/*')
+GO_BUILD_FLAGS ?= -buildvcs=false
 
 # Container settings
 REGISTRY ?= localhost:5000
@@ -88,19 +89,19 @@ bpf: $(BPF_OBJECTS)
 .PHONY: build-server
 build-server: generate
 	@echo "Building $(BINARY_NAME)..."
-	go build -o bin/$(BINARY_NAME) ./cmd/server
+	go build $(GO_BUILD_FLAGS) -o bin/$(BINARY_NAME) ./cmd/server
 
 # Build the aggregator binary
 .PHONY: build-aggregator
 build-aggregator: generate docs-aggregator
 	@echo "Building $(AGGREGATOR_NAME)..."
-	go build -o bin/$(AGGREGATOR_NAME) ./cmd/aggregator
+	go build $(GO_BUILD_FLAGS) -o bin/$(AGGREGATOR_NAME) ./cmd/aggregator
 
 # Build the aggregator binary without eBPF dependencies (for Docker)
 .PHONY: build-aggregator-only
 build-aggregator-only: docs-aggregator
 	@echo "Building $(AGGREGATOR_NAME) (no eBPF dependencies)..."
-	go build -o bin/$(AGGREGATOR_NAME) ./cmd/aggregator
+	go build $(GO_BUILD_FLAGS) -o bin/$(AGGREGATOR_NAME) ./cmd/aggregator
 
 # Build both binaries
 .PHONY: build
@@ -110,7 +111,7 @@ build: build-server build-aggregator
 .PHONY: build-dev
 build-dev: generate
 	@echo "Building $(BINARY_NAME) with debug symbols and debug logging..."
-	CGO_ENABLED=1 CC=clang go build -race -tags debug -o bin/$(BINARY_NAME)-dev ./cmd/server
+	CGO_ENABLED=1 CC=clang go build $(GO_BUILD_FLAGS) -race -tags debug -o bin/$(BINARY_NAME)-dev ./cmd/server
 
 # Run the server (requires root for eBPF) - HTTP transport
 .PHONY: run

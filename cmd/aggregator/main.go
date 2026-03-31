@@ -26,7 +26,6 @@ func main() {
 		httpAddr        = flag.String("addr", ":8081", "HTTP server address")
 		dbURL           = flag.String("db-url", os.Getenv("DB_URL"), "PostgreSQL connection string (optional)")
 		flowCacheTTL    = flag.Duration("flow-cache-ttl", 5*time.Minute, "Flow cache TTL for interface mapping (Phase 1B)")
-		metaWindow      = flag.Duration("meta-window", 10*time.Minute, "In-memory metadata rollup window")
 		metaFlushInt    = flag.Duration("meta-flush-interval", 30*time.Second, "Metadata rollup flush interval")
 		disableEnricher = flag.Bool("disable-enricher", false, "Disable event enricher (for testing)")
 	)
@@ -111,7 +110,6 @@ func main() {
 		HTTPAddr:          *httpAddr,
 		Storage:           pgStorage,
 		Enricher:          enricher, // Pass enricher to aggregator for event pipeline integration (Phase 1B)
-		MetaWindow:        *metaWindow,
 		MetaFlushInterval: *metaFlushInt,
 	})
 	if err != nil {

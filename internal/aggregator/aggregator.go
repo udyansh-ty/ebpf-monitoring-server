@@ -124,7 +124,6 @@ type Config struct {
 	// Allow callers to supply a storage backend instead of always using memory.
 	Storage           core.EventSink
 	Enricher          *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
-	MetaWindow        time.Duration         // In-memory metadata rollup window
 	MetaFlushInterval time.Duration         // Periodic metadata rollup flush interval
 }
 
@@ -142,7 +141,6 @@ type Aggregator struct {
 	stats        *Stats
 	programCache *ProgramCache
 	enricher     *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
-	metaWindow   time.Duration
 	metaFlushInt time.Duration
 	metaRollups  map[metaRollupKey]*metaRollupAggregate
 	metaMu       sync.RWMutex
@@ -169,15 +167,10 @@ type metaRollupAggregate struct {
 	LastSeenEpoch  int64
 }
 
-const defaultMetaWindow = 10 * time.Minute
 const defaultMetaFlushInterval = 30 * time.Second
 
 type metaWindowBatchWriter interface {
 	UpsertMetaWindowRows(ctx context.Context, rows []storage.EBPFMetaWindowRow) error
-}
-
-type metaWindowRetentionStore interface {
-	DeleteMetaWindowOlderThan(ctx context.Context, keepWindowSeconds int64) (int64, error)
 }
 
 // Stats represents aggregation statistics.
@@ -202,10 +195,6 @@ func New(config *Config) (*Aggregator, error) {
 	if eventStorage == nil {
 		eventStorage = storage.NewMemoryStorage()
 	}
-	metaWindow := config.MetaWindow
-	if metaWindow <= 0 {
-		metaWindow = defaultMetaWindow
-	}
 	metaFlushInt := config.MetaFlushInterval
 	if metaFlushInt <= 0 {
 		metaFlushInt = defaultMetaFlushInterval
@@ -221,7 +210,6 @@ func New(config *Config) (*Aggregator, error) {
 		},
 		programCache: &ProgramCache{},
 		enricher:     config.Enricher, // Use enricher from config (optional)
-		metaWindow:   metaWindow,
 		metaFlushInt: metaFlushInt,
 		metaRollups:  make(map[metaRollupKey]*metaRollupAggregate),
 	}, nil
@@ -592,10 +580,8 @@ func (a *Aggregator) invalidateProgramCache() {
 // cleanupRoutine runs periodic cleanup of old events to prevent memory bloat
 func (a *Aggregator) cleanupRoutine(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute) // Event cleanup every 5 minutes
-	pruneTicker := time.NewTicker(30 * time.Second)
 	flushTicker := time.NewTicker(a.metaFlushInt)
 	defer ticker.Stop()
-	defer pruneTicker.Stop()
 	defer flushTicker.Stop()
 
 	for {
@@ -603,18 +589,14 @@ func (a *Aggregator) cleanupRoutine(ctx context.Context) {
 		case <-ctx.Done():
 			nowEpoch := time.Now().UTC().Unix()
 			a.flushMetaRollups(context.Background(), nowEpoch)
-			a.runMetaWindowRetention(context.Background())
 			logger.Debug("Cleanup routine stopping due to context cancellation")
 			return
-		case <-pruneTicker.C:
-			a.pruneMetaRollups(time.Now().UTC().Unix())
 		case <-flushTicker.C:
 			if !a.IsRunning() {
 				continue
 			}
 			nowEpoch := time.Now().UTC().Unix()
 			a.flushMetaRollups(ctx, nowEpoch)
-			a.runMetaWindowRetention(ctx)
 		case <-ticker.C:
 			if !a.IsRunning() {
 				continue
@@ -639,45 +621,23 @@ func (a *Aggregator) flushMetaRollups(ctx context.Context, nowEpoch int64) {
 		return
 	}
 
-	rows := a.drainMetaRollups(nowEpoch)
+	rows := a.drainMetaRollups()
 	if len(rows) == 0 {
 		return
 	}
 
-	logger.Infof("[FLUSH] Flushing %d meta-window rollup entries to postgres (epoch=%d)", len(rows), nowEpoch)
+	logger.Infof("[FLUSH] Flushing %d metadata rollup entries to postgres (epoch=%d)", len(rows), nowEpoch)
 
 	if err := writer.UpsertMetaWindowRows(ctx, rows); err != nil {
-		logger.Errorf("[FLUSH] Meta-window flush failed: %v", err)
+		logger.Errorf("[FLUSH] Metadata rollup flush failed: %v", err)
 		a.mergeMetaRollupRows(rows)
 		return
 	}
 
-	logger.Infof("[FLUSH] Meta-window flush complete")
+	logger.Infof("[FLUSH] Metadata rollup flush complete")
 }
 
-func (a *Aggregator) runMetaWindowRetention(ctx context.Context) {
-	retentionStore, ok := a.storage.(metaWindowRetentionStore)
-	if !ok {
-		return
-	}
-
-	keepWindowSeconds := int64(a.metaWindow / time.Second)
-	if keepWindowSeconds <= 0 {
-		keepWindowSeconds = int64(defaultMetaWindow / time.Second)
-	}
-
-	deletedRows, err := retentionStore.DeleteMetaWindowOlderThan(ctx, keepWindowSeconds)
-	if err != nil {
-		logger.Errorf("Failed metadata retention cleanup (window=%ds): %v", keepWindowSeconds, err)
-		return
-	}
-
-	if deletedRows > 0 {
-		logger.Debugf("Metadata retention removed %d row(s) older than %ds", deletedRows, keepWindowSeconds)
-	}
-}
-
-func (a *Aggregator) drainMetaRollups(nowEpoch int64) []storage.EBPFMetaWindowRow {
+func (a *Aggregator) drainMetaRollups() []storage.EBPFMetaWindowRow {
 	a.metaMu.Lock()
 	if len(a.metaRollups) == 0 {
 		a.metaMu.Unlock()
@@ -692,14 +652,6 @@ func (a *Aggregator) drainMetaRollups(nowEpoch int64) []storage.EBPFMetaWindowRo
 	for key, entry := range drained {
 		if entry == nil {
 			continue
-		}
-
-		// Ignore obviously invalid rollups and keep map bounded by configured window.
-		if nowEpoch > 0 {
-			cutoffEpoch := nowEpoch - int64(a.metaWindow/time.Second)
-			if cutoffEpoch > 0 && entry.LastSeenEpoch < cutoffEpoch {
-				continue
-			}
 		}
 		if key.SrcIP == "" || key.DstIP == "" {
 			continue
@@ -1148,24 +1100,6 @@ func extractPortFromEndpoint(raw string) int64 {
 	return parsed
 }
 
-func (a *Aggregator) pruneMetaRollups(nowEpoch int64) {
-	if nowEpoch <= 0 {
-		return
-	}
-	cutoffEpoch := nowEpoch - int64(a.metaWindow/time.Second)
-	if cutoffEpoch <= 0 {
-		return
-	}
-
-	a.metaMu.Lock()
-	defer a.metaMu.Unlock()
-	for key, entry := range a.metaRollups {
-		if entry.LastSeenEpoch < cutoffEpoch {
-			delete(a.metaRollups, key)
-		}
-	}
-}
-
 func getStringValue(metadata map[string]interface{}, key string) string {
 	raw, ok := metadata[key]
 	if !ok {
@@ -1314,7 +1248,7 @@ func epochSecondsFromAuto(v int64) int64 {
 
 	// Kernel tracepoints frequently emit monotonic timestamps (seconds since boot),
 	// not Unix epoch seconds. These values are typically far below year-2000 epoch.
-	// Map them to "now" to keep retention/window logic valid for rollups.
+	// Map them to "now" so rollup bucketing stays aligned with wall-clock time.
 	if seconds > 0 && seconds < 946684800 {
 		return time.Now().UTC().Unix()
 	}

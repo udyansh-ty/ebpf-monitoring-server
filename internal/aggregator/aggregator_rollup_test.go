@@ -4,20 +4,15 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/internal/storage"
 )
 
 type metaWindowTestStorage struct {
-	upsertErr        error
-	rows             []storage.EBPFMetaWindowRow
-	calls            int
-	retentionErr     error
-	retentionCalls   int
-	retentionWindow  int64
-	retentionDeleted int64
+	upsertErr error
+	rows      []storage.EBPFMetaWindowRow
+	calls     int
 }
 
 func (s *metaWindowTestStorage) Store(context.Context, core.Event) error {
@@ -36,12 +31,6 @@ func (s *metaWindowTestStorage) UpsertMetaWindowRows(_ context.Context, rows []s
 	s.calls++
 	s.rows = append(s.rows, rows...)
 	return s.upsertErr
-}
-
-func (s *metaWindowTestStorage) DeleteMetaWindowOlderThan(_ context.Context, keepWindowSeconds int64) (int64, error) {
-	s.retentionCalls++
-	s.retentionWindow = keepWindowSeconds
-	return s.retentionDeleted, s.retentionErr
 }
 
 func (s *metaWindowTestStorage) rowsByKey() map[metaRollupKey]storage.EBPFMetaWindowRow {
@@ -352,34 +341,6 @@ func TestTrackMetaWindowRollupSeparatesByPortAndInterface(t *testing.T) {
 	}
 }
 
-func TestPruneMetaRollupsRemovesExpiredKeys(t *testing.T) {
-	agg, err := New(&Config{MetaWindow: 10 * time.Minute})
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-
-	now := time.Now().UTC().Unix()
-	agg.metaRollups[metaRollupKey{BucketEpoch: now - 720, SrcIP: "10.0.0.1", DstIP: "8.8.8.8"}] = &metaRollupAggregate{
-		LastSeenEpoch: now - 700,
-	}
-	agg.metaRollups[metaRollupKey{BucketEpoch: now - 120, SrcIP: "10.0.0.2", DstIP: "1.1.1.1"}] = &metaRollupAggregate{
-		LastSeenEpoch: now - 60,
-	}
-
-	agg.pruneMetaRollups(now)
-
-	agg.metaMu.RLock()
-	defer agg.metaMu.RUnlock()
-	if len(agg.metaRollups) != 1 {
-		t.Fatalf("expected 1 rollup after prune, got %d", len(agg.metaRollups))
-	}
-	for _, entry := range agg.metaRollups {
-		if entry.LastSeenEpoch < now-600 {
-			t.Fatalf("found expired rollup that should have been pruned: %+v", entry)
-		}
-	}
-}
-
 func TestFlushMetaRollupsBatchesAndDrains(t *testing.T) {
 	testStorage := &metaWindowTestStorage{}
 	agg, err := New(&Config{
@@ -495,46 +456,5 @@ func TestFlushMetaRollupsRequeuesOnFailure(t *testing.T) {
 	}
 	if entry.SessionCount != 3 || entry.PacketsIn != 18 || entry.PacketsOut != 30 {
 		t.Fatalf("unexpected restored rollup values: %+v", entry)
-	}
-}
-
-func TestRunMetaWindowRetentionUsesConfiguredWindow(t *testing.T) {
-	testStorage := &metaWindowTestStorage{
-		retentionDeleted: 4,
-	}
-	agg, err := New(&Config{
-		Storage:    testStorage,
-		MetaWindow: 10 * time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-
-	agg.runMetaWindowRetention(context.Background())
-
-	if testStorage.retentionCalls != 1 {
-		t.Fatalf("expected one retention call, got %d", testStorage.retentionCalls)
-	}
-	if testStorage.retentionWindow != 600 {
-		t.Fatalf("expected retention window 600 seconds, got %d", testStorage.retentionWindow)
-	}
-}
-
-func TestRunMetaWindowRetentionUsesDefaultWindow(t *testing.T) {
-	testStorage := &metaWindowTestStorage{}
-	agg, err := New(&Config{
-		Storage: testStorage,
-	})
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-
-	agg.runMetaWindowRetention(context.Background())
-
-	if testStorage.retentionCalls != 1 {
-		t.Fatalf("expected one retention call, got %d", testStorage.retentionCalls)
-	}
-	if testStorage.retentionWindow != 600 {
-		t.Fatalf("expected default retention window 600 seconds, got %d", testStorage.retentionWindow)
 	}
 }

@@ -9,12 +9,12 @@ import (
 )
 
 // ANCHOR: eBPF Metadata Window Aggregate Table - Phase 2
-// WHY: Persist only short-window aggregate metadata keyed by minute bucket + flow dimensions
-// WHAT: Lightweight aggregate table for bounded retention and lower write amplification
-// HOW: UNLOGGED table with compact counters and minimal indexing
+// WHY: Persist aggregate metadata keyed by minute bucket + flow dimensions
+// WHAT: Durable aggregate table with compact counters and minimal indexing
+// HOW: Regular (logged) PostgreSQL table with composite key and supporting indexes
 // Stores: bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni
 const createEBPFMetaWindowTable = `
-CREATE UNLOGGED TABLE IF NOT EXISTS ebpf_meta_window (
+CREATE TABLE IF NOT EXISTS ebpf_meta_window (
   bucket_epoch      BIGINT NOT NULL,
   src_ip            INET   NOT NULL,
   dst_ip            INET   NOT NULL,
@@ -46,6 +46,26 @@ CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_iface
 -- Index for SNI queries
 CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_sni
   ON ebpf_meta_window (sni, bucket_epoch DESC);
+`
+
+// ANCHOR: Ensure durability for existing deployments
+// WHY: Older schema revisions created ebpf_meta_window as UNLOGGED, which can lose data on crash
+// WHAT: Promote ebpf_meta_window to LOGGED when needed
+// HOW: Check relpersistence and apply ALTER TABLE ... SET LOGGED conditionally
+const ensureEBPFMetaWindowLogged = `
+DO $$
+DECLARE
+  persistence "char";
+BEGIN
+  SELECT c.relpersistence INTO persistence
+  FROM pg_class c
+  WHERE c.oid = 'ebpf_meta_window'::regclass;
+
+  IF persistence = 'u' THEN
+    EXECUTE 'ALTER TABLE ebpf_meta_window SET LOGGED';
+  END IF;
+END;
+$$;
 `
 
 // ANCHOR: Ensure SNI column + PK for existing deployments
@@ -88,20 +108,60 @@ END;
 $$;
 `
 
+// ANCHOR: Hard block data deletion from ebpf_meta_window
+// WHY: Enforce "retain all data" even if an external job or stale binary issues DELETE/TRUNCATE
+// WHAT: Install trigger function + trigger that rejects DELETE and TRUNCATE operations
+// HOW: CREATE OR REPLACE FUNCTION + conditional CREATE TRIGGER via pg_trigger catalog
+const ensureEBPFMetaWindowNoDelete = `
+CREATE OR REPLACE FUNCTION prevent_ebpf_meta_window_delete()
+RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'deletion is disabled for table ebpf_meta_window';
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'trg_prevent_ebpf_meta_window_delete'
+      AND tgrelid = 'ebpf_meta_window'::regclass
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER trg_prevent_ebpf_meta_window_delete
+    BEFORE DELETE OR TRUNCATE ON ebpf_meta_window
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION prevent_ebpf_meta_window_delete();
+  END IF;
+END;
+$$;
+`
+
 // RunMigrations creates the metadata window table.
 // ANCHOR: Only metadata window - Phase 2 aggregate storage - Mar 21, 2026
 // WHY: Store only sessionized connection metadata with src/dst ports and interface
-// WHAT: Create UNLOGGED table with bucket_epoch, IPs, ports, interface as composite key
-// HOW: Single CREATE IF NOT EXISTS - no ALTER statements, all columns defined upfront
+// WHAT: Create durable table with bucket_epoch, IPs, ports, interface as composite key
+// HOW: Create/migrate schema on startup with idempotent SQL blocks
 func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 	_, err := conn.Exec(ctx, createEBPFMetaWindowTable)
 	if err != nil {
 		return fmt.Errorf("failed to create ebpf_meta_window table: %w", err)
 	}
 
+	_, err = conn.Exec(ctx, ensureEBPFMetaWindowLogged)
+	if err != nil {
+		return fmt.Errorf("failed to enforce ebpf_meta_window durability: %w", err)
+	}
+
 	_, err = conn.Exec(ctx, ensureEBPFMetaWindowSNISchema)
 	if err != nil {
 		return fmt.Errorf("failed to migrate ebpf_meta_window schema: %w", err)
+	}
+
+	_, err = conn.Exec(ctx, ensureEBPFMetaWindowNoDelete)
+	if err != nil {
+		return fmt.Errorf("failed to enforce ebpf_meta_window no-delete policy: %w", err)
 	}
 
 	return nil
