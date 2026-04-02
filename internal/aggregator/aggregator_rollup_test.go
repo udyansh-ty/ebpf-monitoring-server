@@ -44,6 +44,7 @@ func (s *metaWindowTestStorage) rowsByKey() map[metaRollupKey]storage.EBPFMetaWi
 			DstPort:     row.DstPort,
 			Interface:   row.InterfaceName,
 			SNI:         row.SNI,
+			PID:         row.PID,
 		}
 		out[key] = row
 	}
@@ -341,6 +342,65 @@ func TestTrackMetaWindowRollupSeparatesByPortAndInterface(t *testing.T) {
 	}
 }
 
+func TestTrackMetaWindowRollupSeparatesByPID(t *testing.T) {
+	agg, err := New(&Config{})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	base := map[string]interface{}{
+		"type":             "connection",
+		"src_ip":           "192.168.1.25",
+		"dst_ip":           "142.250.183.69",
+		"duration_ms":      float64(1000),
+		"packets_incoming": float64(4),
+		"packets_outgoing": float64(6),
+		"session_start_ns": float64(1773919447000000000),
+		"session_end_ns":   float64(1773919458000000000),
+	}
+
+	first := make(map[string]interface{}, len(base)+1)
+	for k, v := range base {
+		first[k] = v
+	}
+	first["pid"] = float64(1001)
+
+	second := make(map[string]interface{}, len(base)+1)
+	for k, v := range base {
+		second[k] = v
+	}
+	second["pid"] = float64(1002)
+
+	agg.trackMetaWindowRollup(first)
+	agg.trackMetaWindowRollup(second)
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+	if len(agg.metaRollups) != 2 {
+		t.Fatalf("expected 2 rollup keys split by pid, got %d", len(agg.metaRollups))
+	}
+
+	keyOne := metaRollupKey{
+		BucketEpoch: 1773919440,
+		SrcIP:       "192.168.1.25",
+		DstIP:       "142.250.183.69",
+		PID:         1001,
+	}
+	if _, ok := agg.metaRollups[keyOne]; !ok {
+		t.Fatalf("expected rollup entry for pid 1001")
+	}
+
+	keyTwo := metaRollupKey{
+		BucketEpoch: 1773919440,
+		SrcIP:       "192.168.1.25",
+		DstIP:       "142.250.183.69",
+		PID:         1002,
+	}
+	if _, ok := agg.metaRollups[keyTwo]; !ok {
+		t.Fatalf("expected rollup entry for pid 1002")
+	}
+}
+
 func TestFlushMetaRollupsBatchesAndDrains(t *testing.T) {
 	testStorage := &metaWindowTestStorage{}
 	agg, err := New(&Config{
@@ -456,5 +516,43 @@ func TestFlushMetaRollupsRequeuesOnFailure(t *testing.T) {
 	}
 	if entry.SessionCount != 3 || entry.PacketsIn != 18 || entry.PacketsOut != 30 {
 		t.Fatalf("unexpected restored rollup values: %+v", entry)
+	}
+}
+
+func TestFlushMetaRollupsIncludesPID(t *testing.T) {
+	testStorage := &metaWindowTestStorage{}
+	agg, err := New(&Config{
+		Storage: testStorage,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.metaMu.Lock()
+	agg.metaRollups[metaRollupKey{
+		BucketEpoch: 1773919440,
+		SrcIP:       "192.168.1.25",
+		DstIP:       "142.250.183.69",
+		PID:         4242,
+	}] = &metaRollupAggregate{
+		ActiveSeconds:  9,
+		PacketsIn:      18,
+		PacketsOut:     30,
+		SessionCount:   3,
+		FirstSeenEpoch: 1773919447,
+		LastSeenEpoch:  1773919478,
+	}
+	agg.metaMu.Unlock()
+
+	agg.flushMetaRollups(context.Background(), 1773919510)
+
+	if testStorage.calls != 1 {
+		t.Fatalf("expected one batch upsert call, got %d", testStorage.calls)
+	}
+	if len(testStorage.rows) != 1 {
+		t.Fatalf("expected one flushed row, got %d", len(testStorage.rows))
+	}
+	if testStorage.rows[0].PID != 4242 {
+		t.Fatalf("expected flushed row pid=4242, got %d", testStorage.rows[0].PID)
 	}
 }
