@@ -12,7 +12,7 @@ import (
 // WHY: Persist aggregate metadata keyed by minute bucket + flow dimensions
 // WHAT: Durable aggregate table with compact counters and minimal indexing
 // HOW: Regular (logged) PostgreSQL table with composite key and supporting indexes
-// Stores: bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni
+// Stores: bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid
 const createEBPFMetaWindowTable = `
 CREATE TABLE IF NOT EXISTS ebpf_meta_window (
   bucket_epoch      BIGINT NOT NULL,
@@ -22,13 +22,14 @@ CREATE TABLE IF NOT EXISTS ebpf_meta_window (
   dst_port          INT    NOT NULL DEFAULT 0,
   interface_name    TEXT   NOT NULL DEFAULT '',
   sni               TEXT   NOT NULL DEFAULT '',
+  pid               BIGINT NOT NULL DEFAULT 0,
   active_seconds    BIGINT NOT NULL DEFAULT 0,
   packets_in        BIGINT NOT NULL DEFAULT 0,
   packets_out       BIGINT NOT NULL DEFAULT 0,
   session_count     BIGINT NOT NULL DEFAULT 0,
   first_seen_epoch  BIGINT NOT NULL,
   last_seen_epoch   BIGINT NOT NULL,
-  PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni)
+  PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid)
 );
 
 -- Essential index for time-based queries
@@ -46,6 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_iface
 -- Index for SNI queries
 CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_sni
   ON ebpf_meta_window (sni, bucket_epoch DESC);
+
+-- Index for process queries
+CREATE INDEX IF NOT EXISTS idx_ebpf_meta_window_pid
+  ON ebpf_meta_window (pid, bucket_epoch DESC);
 `
 
 // ANCHOR: Ensure durability for existing deployments
@@ -68,11 +73,11 @@ END;
 $$;
 `
 
-// ANCHOR: Ensure SNI column + PK for existing deployments
-// WHY: Older schemas may be missing sni or use a smaller primary key
-// WHAT: Add sni column (default empty) and update PK to include sni
+// ANCHOR: Ensure SNI + PID columns + PK for existing deployments
+// WHY: Older schemas may be missing sni/pid or use a smaller primary key
+// WHAT: Add sni/pid columns and update PK to include both
 // HOW: DO block to conditionally alter table and primary key
-const ensureEBPFMetaWindowSNISchema = `
+const ensureEBPFMetaWindowPIDSNISchema = `
 DO $$
 DECLARE
   pk_name TEXT;
@@ -80,6 +85,8 @@ DECLARE
 BEGIN
   ALTER TABLE ebpf_meta_window
     ADD COLUMN IF NOT EXISTS sni TEXT NOT NULL DEFAULT '';
+  ALTER TABLE ebpf_meta_window
+    ADD COLUMN IF NOT EXISTS pid BIGINT NOT NULL DEFAULT 0;
 
   SELECT EXISTS (
     SELECT 1
@@ -87,7 +94,7 @@ BEGIN
     JOIN pg_class t ON c.conrelid = t.oid
     WHERE t.relname = 'ebpf_meta_window'
       AND c.contype = 'p'
-      AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni)'
+      AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid)'
   ) INTO has_target_pk;
 
   IF NOT has_target_pk THEN
@@ -102,7 +109,7 @@ BEGIN
     END IF;
 
     ALTER TABLE ebpf_meta_window
-      ADD PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni);
+      ADD PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid);
   END IF;
 END;
 $$;
@@ -154,7 +161,7 @@ func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 		return fmt.Errorf("failed to enforce ebpf_meta_window durability: %w", err)
 	}
 
-	_, err = conn.Exec(ctx, ensureEBPFMetaWindowSNISchema)
+	_, err = conn.Exec(ctx, ensureEBPFMetaWindowPIDSNISchema)
 	if err != nil {
 		return fmt.Errorf("failed to migrate ebpf_meta_window schema: %w", err)
 	}
