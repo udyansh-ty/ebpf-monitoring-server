@@ -156,6 +156,7 @@ type metaRollupKey struct {
 	DstPort     int64
 	Interface   string
 	SNI         string
+	PID         int64
 }
 
 type metaRollupAggregate struct {
@@ -665,6 +666,7 @@ func (a *Aggregator) drainMetaRollups() []storage.EBPFMetaWindowRow {
 			DstPort:        key.DstPort,
 			InterfaceName:  key.Interface,
 			SNI:            key.SNI,
+			PID:            key.PID,
 			ActiveSeconds:  entry.ActiveSeconds,
 			PacketsIn:      entry.PacketsIn,
 			PacketsOut:     entry.PacketsOut,
@@ -694,6 +696,7 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 			DstPort:     row.DstPort,
 			Interface:   strings.TrimSpace(row.InterfaceName),
 			SNI:         row.SNI,
+			PID:         row.PID,
 		}
 
 		if existing, ok := a.metaRollups[key]; ok {
@@ -881,6 +884,8 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	sni := extractSNI(metadataMaps)
 	srcPort := normalizePort(findFirstPort(metadataMaps, "src_port", "source_port", "sport"))
 	dstPort := normalizePort(findFirstPort(metadataMaps, "dst_port", "dest_port", "destination_port", "dport", "port"))
+	pid, _ := getInt64FromMaps(metadataMaps, "pid", "process_id", "tgid")
+	pid = normalizePID(pid)
 	if srcPort == 0 {
 		srcPort = normalizePort(extractPortFromEndpoint(findFirstStringValue(metadataMaps, "src_ip", "source_ip", "source_addr", "src_addr")))
 	}
@@ -897,6 +902,7 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		DstPort:     dstPort,
 		Interface:   iface,
 		SNI:         sni,
+		PID:         pid,
 	}
 
 	a.metaMu.Lock()
@@ -1078,6 +1084,13 @@ func normalizePort(port int64) int64 {
 		return 0
 	}
 	return port
+}
+
+func normalizePID(pid int64) int64 {
+	if pid < 0 {
+		return 0
+	}
+	return pid
 }
 
 func extractPortFromEndpoint(raw string) int64 {
