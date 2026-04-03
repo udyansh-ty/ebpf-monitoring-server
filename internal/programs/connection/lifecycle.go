@@ -2,6 +2,7 @@ package connection
 
 import (
 	"bufio"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -38,7 +39,7 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 	// Determine which file to read based on address family
 	procFile := "/proc/net/tcp"
 	if key.Family == afInet6 {
-		procFile = "/proc/net/ipv6_route"
+		procFile = "/proc/net/tcp6"
 	}
 
 	file, err := os.Open(procFile)
@@ -48,9 +49,7 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 	}
 	defer file.Close()
 
-	stats := &ConnectionStats{
-		ActiveSeconds: int64(time.Since(connStartTime).Seconds()),
-	}
+	stats := &ConnectionStats{}
 
 	scanner := bufio.NewScanner(file)
 
@@ -67,7 +66,7 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 		line := scanner.Text()
 		fields := strings.Fields(line)
 
-		// Need at least: local_address(1), rem_address(2), tx_queue(3), rx_queue(4)
+		// Need at least: local_address(1), rem_address(2), st(3), tx_queue:rx_queue(4)
 		if len(fields) < 5 {
 			continue
 		}
@@ -75,8 +74,12 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 		// fields[0] is the index (sl), fields[1] is local_address, fields[2] is rem_address
 		localAddr := fields[1]
 		remoteAddr := fields[2]
-		txQueue := fields[3]
-		rxQueue := fields[4]
+		queues := strings.SplitN(fields[4], ":", 2)
+		if len(queues) != 2 {
+			continue
+		}
+		txQueueHex := queues[0]
+		rxQueueHex := queues[1]
 
 		// Parse local address (source IP:port)
 		localParts := strings.Split(localAddr, ":")
@@ -107,8 +110,8 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 			remoteIP == key.DstIP && uint16(remotePort) == key.DstPort {
 
 			// Parse queue sizes (they're in hex)
-			txVal, err1 := strconv.ParseUint(txQueue, 16, 64)
-			rxVal, err2 := strconv.ParseUint(rxQueue, 16, 64)
+			txVal, err1 := strconv.ParseUint(txQueueHex, 16, 64)
+			rxVal, err2 := strconv.ParseUint(rxQueueHex, 16, 64)
 
 			if err1 == nil {
 				stats.TxQueue = txVal
@@ -116,6 +119,11 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 			if err2 == nil {
 				stats.RxQueue = rxVal
 			}
+			activeSeconds := int64(time.Since(connStartTime).Seconds())
+			if activeSeconds < 1 {
+				activeSeconds = 1
+			}
+			stats.ActiveSeconds = activeSeconds
 
 			logger.Debugf("[Lifecycle] Found connection %s:%d -> %s:%d: tx=%d rx=%d active=%ds",
 				localIP, localPort, remoteIP, remotePort, txVal, rxVal, stats.ActiveSeconds)
@@ -128,7 +136,7 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 	logger.Debugf("[Lifecycle] Connection %s:%d -> %s:%d not found in /proc/net/tcp",
 		key.SrcIP, key.SrcPort, key.DstIP, key.DstPort)
 
-	return stats
+	return nil
 }
 
 // convertIPv4HexToString converts hex string from /proc/net/tcp to dotted IP
@@ -183,10 +191,26 @@ func enrichEventWithLifecycleData(
 	}
 
 	// Add to metadata
-	metadata["packets_in"] = stats.RxQueue
-	metadata["packets_out"] = stats.TxQueue
+	metadata["packets_in"] = estimatePacketCountFromBytes(stats.RxQueue)
+	metadata["packets_out"] = estimatePacketCountFromBytes(stats.TxQueue)
+	metadata["packets_incoming"] = metadata["packets_in"]
+	metadata["packets_outgoing"] = metadata["packets_out"]
+	metadata["rx_queue_bytes"] = stats.RxQueue
+	metadata["tx_queue_bytes"] = stats.TxQueue
 	metadata["active_seconds"] = stats.ActiveSeconds
 
 	logger.Debugf("[Lifecycle] Added stats to event: in=%d out=%d active=%ds",
-		stats.RxQueue, stats.TxQueue, stats.ActiveSeconds)
+		metadata["packets_in"], metadata["packets_out"], stats.ActiveSeconds)
+}
+
+func estimatePacketCountFromBytes(queueBytes uint64) int64 {
+	if queueBytes == 0 {
+		return 0
+	}
+	// Approximate packet count using standard MTU payload size.
+	packetEstimate := int64(math.Ceil(float64(queueBytes) / 1500.0))
+	if packetEstimate < 1 {
+		return 1
+	}
+	return packetEstimate
 }
