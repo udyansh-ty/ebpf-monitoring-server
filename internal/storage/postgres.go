@@ -73,7 +73,16 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 			$9, $10, $11, $12,
 			$13, $14
 		)
-		ON CONFLICT (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid) DO UPDATE SET
+		ON CONFLICT (src_ip, dst_ip, src_port, dst_port, interface_name) DO UPDATE SET
+			bucket_epoch = GREATEST(ebpf_meta_window.bucket_epoch, EXCLUDED.bucket_epoch),
+			sni = CASE
+				WHEN EXCLUDED.sni <> '' THEN EXCLUDED.sni
+				ELSE ebpf_meta_window.sni
+			END,
+			pid = CASE
+				WHEN EXCLUDED.pid > 0 THEN EXCLUDED.pid
+				ELSE ebpf_meta_window.pid
+			END,
 			active_seconds = ebpf_meta_window.active_seconds + EXCLUDED.active_seconds,
 			packets_in = ebpf_meta_window.packets_in + EXCLUDED.packets_in,
 			packets_out = ebpf_meta_window.packets_out + EXCLUDED.packets_out,

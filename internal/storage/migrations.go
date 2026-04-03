@@ -12,7 +12,7 @@ import (
 // WHY: Persist aggregate metadata keyed by minute bucket + flow dimensions
 // WHAT: Durable aggregate table with compact counters and minimal indexing
 // HOW: Regular (logged) PostgreSQL table with composite key and supporting indexes
-// Stores: bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid
+// Stores: bucket_epoch + aggregate counters, keyed by src/dst IP+port and interface
 const createEBPFMetaWindowTable = `
 CREATE TABLE IF NOT EXISTS ebpf_meta_window (
   bucket_epoch      BIGINT NOT NULL,
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS ebpf_meta_window (
   session_count     BIGINT NOT NULL DEFAULT 0,
   first_seen_epoch  BIGINT NOT NULL,
   last_seen_epoch   BIGINT NOT NULL,
-  PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid)
+  PRIMARY KEY (src_ip, dst_ip, src_port, dst_port, interface_name)
 );
 
 -- Essential index for time-based queries
@@ -73,14 +73,13 @@ END;
 $$;
 `
 
-// ANCHOR: Ensure SNI + PID columns + PK for existing deployments
-// WHY: Older schemas may be missing sni/pid or use a smaller primary key
-// WHAT: Add sni/pid columns and update PK to include both
-// HOW: DO block to conditionally alter table and primary key
-const ensureEBPFMetaWindowPIDSNISchema = `
+// ANCHOR: Normalize metadata window merge key for existing deployments
+// WHY: Older schemas keyed rows by bucket/sni/pid and produced duplicates for same 5-tuple flow
+// WHAT: Rebuild schema so rows merge by src_ip,dst_ip,src_port,dst_port,interface_name
+// HOW: Conditionally rebuild table and aggregate existing rows into the new primary key
+const ensureEBPFMetaWindowMergeKeySchema = `
 DO $$
 DECLARE
-  pk_name TEXT;
   has_target_pk BOOLEAN;
 BEGIN
   ALTER TABLE ebpf_meta_window
@@ -94,22 +93,52 @@ BEGIN
     JOIN pg_class t ON c.conrelid = t.oid
     WHERE t.relname = 'ebpf_meta_window'
       AND c.contype = 'p'
-      AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid)'
+      AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (src_ip, dst_ip, src_port, dst_port, interface_name)'
   ) INTO has_target_pk;
 
   IF NOT has_target_pk THEN
-    SELECT c.conname INTO pk_name
-    FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    WHERE t.relname = 'ebpf_meta_window' AND c.contype = 'p'
-    LIMIT 1;
+    CREATE TABLE ebpf_meta_window_rebuild (
+      bucket_epoch      BIGINT NOT NULL,
+      src_ip            INET   NOT NULL,
+      dst_ip            INET   NOT NULL,
+      src_port          INT    NOT NULL DEFAULT 0,
+      dst_port          INT    NOT NULL DEFAULT 0,
+      interface_name    TEXT   NOT NULL DEFAULT '',
+      sni               TEXT   NOT NULL DEFAULT '',
+      pid               BIGINT NOT NULL DEFAULT 0,
+      active_seconds    BIGINT NOT NULL DEFAULT 0,
+      packets_in        BIGINT NOT NULL DEFAULT 0,
+      packets_out       BIGINT NOT NULL DEFAULT 0,
+      session_count     BIGINT NOT NULL DEFAULT 0,
+      first_seen_epoch  BIGINT NOT NULL,
+      last_seen_epoch   BIGINT NOT NULL,
+      PRIMARY KEY (src_ip, dst_ip, src_port, dst_port, interface_name)
+    );
 
-    IF pk_name IS NOT NULL THEN
-      EXECUTE format('ALTER TABLE ebpf_meta_window DROP CONSTRAINT %I', pk_name);
-    END IF;
+    INSERT INTO ebpf_meta_window_rebuild (
+      bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid,
+      active_seconds, packets_in, packets_out, session_count, first_seen_epoch, last_seen_epoch
+    )
+    SELECT
+      COALESCE(MAX(bucket_epoch), 0) AS bucket_epoch,
+      src_ip,
+      dst_ip,
+      src_port,
+      dst_port,
+      interface_name,
+      COALESCE(MAX(NULLIF(sni, '')), '') AS sni,
+      COALESCE(MAX(pid), 0) AS pid,
+      COALESCE(SUM(active_seconds), 0) AS active_seconds,
+      COALESCE(SUM(packets_in), 0) AS packets_in,
+      COALESCE(SUM(packets_out), 0) AS packets_out,
+      COALESCE(SUM(session_count), 0) AS session_count,
+      COALESCE(MIN(first_seen_epoch), 0) AS first_seen_epoch,
+      COALESCE(MAX(last_seen_epoch), 0) AS last_seen_epoch
+    FROM ebpf_meta_window
+    GROUP BY src_ip, dst_ip, src_port, dst_port, interface_name;
 
-    ALTER TABLE ebpf_meta_window
-      ADD PRIMARY KEY (bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid);
+    DROP TABLE ebpf_meta_window CASCADE;
+    ALTER TABLE ebpf_meta_window_rebuild RENAME TO ebpf_meta_window;
   END IF;
 END;
 $$;
@@ -161,9 +190,15 @@ func RunMigrations(ctx context.Context, conn *pgx.Conn) error {
 		return fmt.Errorf("failed to enforce ebpf_meta_window durability: %w", err)
 	}
 
-	_, err = conn.Exec(ctx, ensureEBPFMetaWindowPIDSNISchema)
+	_, err = conn.Exec(ctx, ensureEBPFMetaWindowMergeKeySchema)
 	if err != nil {
 		return fmt.Errorf("failed to migrate ebpf_meta_window schema: %w", err)
+	}
+
+	// Re-run index creation after potential table rebuild in migration block.
+	_, err = conn.Exec(ctx, createEBPFMetaWindowTable)
+	if err != nil {
+		return fmt.Errorf("failed to ensure ebpf_meta_window indexes: %w", err)
 	}
 
 	_, err = conn.Exec(ctx, ensureEBPFMetaWindowNoDelete)

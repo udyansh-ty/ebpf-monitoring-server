@@ -38,14 +38,11 @@ func (s *metaWindowTestStorage) rowsByKey() map[metaRollupKey]storage.EBPFMetaWi
 	out := make(map[metaRollupKey]storage.EBPFMetaWindowRow, len(s.rows))
 	for _, row := range s.rows {
 		key := metaRollupKey{
-			BucketEpoch: row.BucketEpoch,
-			SrcIP:       row.SrcIP,
-			DstIP:       row.DstIP,
-			SrcPort:     row.SrcPort,
-			DstPort:     row.DstPort,
-			Interface:   row.InterfaceName,
-			SNI:         row.SNI,
-			PID:         row.PID,
+			SrcIP:     row.SrcIP,
+			DstIP:     row.DstIP,
+			SrcPort:   row.SrcPort,
+			DstPort:   row.DstPort,
+			Interface: row.InterfaceName,
 		}
 		out[key] = row
 	}
@@ -89,9 +86,8 @@ func TestTrackMetaWindowRollupAggregatesByMinuteAndPair(t *testing.T) {
 	}
 
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -161,9 +157,8 @@ func TestTrackMetaWindowRollupStartsNewSessionAfterTimeout(t *testing.T) {
 	defer agg.metaMu.RUnlock()
 
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -208,9 +203,8 @@ func TestTrackMetaWindowRollupKeepsBucketStableForActiveSession(t *testing.T) {
 	}
 
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -292,10 +286,8 @@ func TestTrackMetaWindowRollupSupportsNestedMetadataAndAliases(t *testing.T) {
 	}
 
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
-		SNI:         "mail.google.com",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -303,6 +295,9 @@ func TestTrackMetaWindowRollupSupportsNestedMetadataAndAliases(t *testing.T) {
 	}
 	if entry.PacketsIn != 9 || entry.PacketsOut != 11 {
 		t.Fatalf("unexpected packet totals for nested metadata: %+v", entry)
+	}
+	if entry.SNI != "mail.google.com" {
+		t.Fatalf("expected normalized sni to be tracked in aggregate, got %q", entry.SNI)
 	}
 }
 
@@ -331,12 +326,10 @@ func TestTrackMetaWindowRollupFallsBackToObservedTimestamp(t *testing.T) {
 	}
 
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "10.10.10.10",
-		DstIP:       "142.250.183.69",
-		SrcPort:     51000,
-		DstPort:     443,
-		SNI:         "mail.google.com",
+		SrcIP:   "10.10.10.10",
+		DstIP:   "142.250.183.69",
+		SrcPort: 51000,
+		DstPort: 443,
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -347,6 +340,9 @@ func TestTrackMetaWindowRollupFallsBackToObservedTimestamp(t *testing.T) {
 	}
 	if entry.SessionCount != 1 {
 		t.Fatalf("expected session_count=1, got %d", entry.SessionCount)
+	}
+	if entry.SNI != "mail.google.com" {
+		t.Fatalf("expected derived sni to be tracked in aggregate, got %q", entry.SNI)
 	}
 }
 
@@ -374,10 +370,9 @@ func TestTrackMetaWindowRollupUsesIngestRemoteIPFallback(t *testing.T) {
 	}
 
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "10.10.10.10",
-		DstIP:       "142.250.183.69",
-		DstPort:     443,
+		SrcIP:   "10.10.10.10",
+		DstIP:   "142.250.183.69",
+		DstPort: 443,
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -388,7 +383,7 @@ func TestTrackMetaWindowRollupUsesIngestRemoteIPFallback(t *testing.T) {
 	}
 }
 
-func TestTrackMetaWindowRollupSeparatesBySNI(t *testing.T) {
+func TestTrackMetaWindowRollupMergesAcrossSNI(t *testing.T) {
 	agg, err := New(&Config{})
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
@@ -422,8 +417,19 @@ func TestTrackMetaWindowRollupSeparatesBySNI(t *testing.T) {
 
 	agg.metaMu.RLock()
 	defer agg.metaMu.RUnlock()
-	if len(agg.metaRollups) != 2 {
-		t.Fatalf("expected 2 rollup keys split by sni, got %d", len(agg.metaRollups))
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected 1 rollup key merged across sni, got %d", len(agg.metaRollups))
+	}
+	key := metaRollupKey{
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for key %+v", key)
+	}
+	if entry.SNI != "www.youtube.com" {
+		t.Fatalf("expected latest non-empty sni to be tracked, got %q", entry.SNI)
 	}
 }
 
@@ -468,7 +474,7 @@ func TestTrackMetaWindowRollupSeparatesByPortAndInterface(t *testing.T) {
 	}
 }
 
-func TestTrackMetaWindowRollupSeparatesByPID(t *testing.T) {
+func TestTrackMetaWindowRollupMergesAcrossPID(t *testing.T) {
 	agg, err := New(&Config{})
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
@@ -502,28 +508,20 @@ func TestTrackMetaWindowRollupSeparatesByPID(t *testing.T) {
 
 	agg.metaMu.RLock()
 	defer agg.metaMu.RUnlock()
-	if len(agg.metaRollups) != 2 {
-		t.Fatalf("expected 2 rollup keys split by pid, got %d", len(agg.metaRollups))
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected 1 rollup key merged across pid, got %d", len(agg.metaRollups))
 	}
 
-	keyOne := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
-		PID:         1001,
+	key := metaRollupKey{
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}
-	if _, ok := agg.metaRollups[keyOne]; !ok {
-		t.Fatalf("expected rollup entry for pid 1001")
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected merged rollup entry for key %+v", key)
 	}
-
-	keyTwo := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
-		PID:         1002,
-	}
-	if _, ok := agg.metaRollups[keyTwo]; !ok {
-		t.Fatalf("expected rollup entry for pid 1002")
+	if entry.PID != 1002 {
+		t.Fatalf("expected latest non-zero pid to be tracked, got %d", entry.PID)
 	}
 }
 
@@ -538,10 +536,10 @@ func TestFlushMetaRollupsBatchesAndDrains(t *testing.T) {
 
 	agg.metaMu.Lock()
 	agg.metaRollups[metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}] = &metaRollupAggregate{
+		BucketEpoch:    1773919440,
 		ActiveSeconds:  12,
 		PacketsIn:      23,
 		PacketsOut:     44,
@@ -550,10 +548,10 @@ func TestFlushMetaRollupsBatchesAndDrains(t *testing.T) {
 		LastSeenEpoch:  1773919478,
 	}
 	agg.metaRollups[metaRollupKey{
-		BucketEpoch: 1773919500,
-		SrcIP:       "10.0.0.2",
-		DstIP:       "8.8.8.8",
+		SrcIP: "10.0.0.2",
+		DstIP: "8.8.8.8",
 	}] = &metaRollupAggregate{
+		BucketEpoch:    1773919500,
 		ActiveSeconds:  7,
 		PacketsIn:      11,
 		PacketsOut:     15,
@@ -574,9 +572,8 @@ func TestFlushMetaRollupsBatchesAndDrains(t *testing.T) {
 
 	rows := testStorage.rowsByKey()
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}
 	row, ok := rows[key]
 	if !ok {
@@ -606,10 +603,10 @@ func TestFlushMetaRollupsRequeuesOnFailure(t *testing.T) {
 
 	agg.metaMu.Lock()
 	agg.metaRollups[metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}] = &metaRollupAggregate{
+		BucketEpoch:    1773919440,
 		ActiveSeconds:  9,
 		PacketsIn:      18,
 		PacketsOut:     30,
@@ -632,9 +629,8 @@ func TestFlushMetaRollupsRequeuesOnFailure(t *testing.T) {
 	}
 
 	key := metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}
 	entry, ok := agg.metaRollups[key]
 	if !ok {
@@ -656,11 +652,11 @@ func TestFlushMetaRollupsIncludesPID(t *testing.T) {
 
 	agg.metaMu.Lock()
 	agg.metaRollups[metaRollupKey{
-		BucketEpoch: 1773919440,
-		SrcIP:       "192.168.1.25",
-		DstIP:       "142.250.183.69",
-		PID:         4242,
+		SrcIP: "192.168.1.25",
+		DstIP: "142.250.183.69",
 	}] = &metaRollupAggregate{
+		BucketEpoch:    1773919440,
+		PID:            4242,
 		ActiveSeconds:  9,
 		PacketsIn:      18,
 		PacketsOut:     30,

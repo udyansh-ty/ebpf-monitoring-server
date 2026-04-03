@@ -153,17 +153,17 @@ type Aggregator struct {
 }
 
 type metaRollupKey struct {
-	BucketEpoch int64
-	SrcIP       string
-	DstIP       string
-	SrcPort     int64
-	DstPort     int64
-	Interface   string
-	SNI         string
-	PID         int64
+	SrcIP     string
+	DstIP     string
+	SrcPort   int64
+	DstPort   int64
+	Interface string
 }
 
 type metaRollupAggregate struct {
+	BucketEpoch    int64
+	SNI            string
+	PID            int64
 	ActiveSeconds  int64
 	PacketsIn      int64
 	PacketsOut     int64
@@ -178,15 +178,12 @@ type metaSessionKey struct {
 	SrcPort   int64
 	DstPort   int64
 	Interface string
-	SNI       string
-	PID       int64
 }
 
 type metaSessionState struct {
 	FirstSeenEpoch        int64
 	LastSeenEpoch         int64
 	ReportedActiveSeconds int64
-	LastBucketEpoch       int64
 	LastUpdatedEpoch      int64
 }
 
@@ -688,14 +685,14 @@ func (a *Aggregator) drainMetaRollups() []storage.EBPFMetaWindowRow {
 		}
 
 		rows = append(rows, storage.EBPFMetaWindowRow{
-			BucketEpoch:    key.BucketEpoch,
+			BucketEpoch:    entry.BucketEpoch,
 			SrcIP:          key.SrcIP,
 			DstIP:          key.DstIP,
 			SrcPort:        key.SrcPort,
 			DstPort:        key.DstPort,
 			InterfaceName:  key.Interface,
-			SNI:            key.SNI,
-			PID:            key.PID,
+			SNI:            entry.SNI,
+			PID:            entry.PID,
 			ActiveSeconds:  entry.ActiveSeconds,
 			PacketsIn:      entry.PacketsIn,
 			PacketsOut:     entry.PacketsOut,
@@ -718,17 +715,23 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 
 	for _, row := range rows {
 		key := metaRollupKey{
-			BucketEpoch: row.BucketEpoch,
-			SrcIP:       row.SrcIP,
-			DstIP:       row.DstIP,
-			SrcPort:     row.SrcPort,
-			DstPort:     row.DstPort,
-			Interface:   strings.TrimSpace(row.InterfaceName),
-			SNI:         row.SNI,
-			PID:         row.PID,
+			SrcIP:     row.SrcIP,
+			DstIP:     row.DstIP,
+			SrcPort:   row.SrcPort,
+			DstPort:   row.DstPort,
+			Interface: strings.TrimSpace(row.InterfaceName),
 		}
 
 		if existing, ok := a.metaRollups[key]; ok {
+			if row.BucketEpoch > existing.BucketEpoch {
+				existing.BucketEpoch = row.BucketEpoch
+			}
+			if row.SNI != "" {
+				existing.SNI = row.SNI
+			}
+			if row.PID > 0 {
+				existing.PID = row.PID
+			}
 			existing.ActiveSeconds += row.ActiveSeconds
 			existing.PacketsIn += row.PacketsIn
 			existing.PacketsOut += row.PacketsOut
@@ -743,6 +746,9 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 		}
 
 		a.metaRollups[key] = &metaRollupAggregate{
+			BucketEpoch:    row.BucketEpoch,
+			SNI:            row.SNI,
+			PID:            row.PID,
 			ActiveSeconds:  row.ActiveSeconds,
 			PacketsIn:      row.PacketsIn,
 			PacketsOut:     row.PacketsOut,
@@ -926,8 +932,6 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		SrcPort:   srcPort,
 		DstPort:   dstPort,
 		Interface: iface,
-		SNI:       sni,
-		PID:       pid,
 	}
 
 	a.metaMu.Lock()
@@ -935,7 +939,7 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 
 	a.pruneMetaSessionsLocked(lastSeenEpoch)
 
-	bucketEpoch := firstSeenEpoch - (firstSeenEpoch % 60)
+	bucketEpoch := lastSeenEpoch - (lastSeenEpoch % 60)
 	if bucketEpoch < 0 {
 		bucketEpoch = 0
 	}
@@ -954,10 +958,8 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 			gap = 0
 		}
 		if gap <= sessionTimeoutSeconds {
-			// Existing live session: keep session_count stable unless we crossed into a new minute bucket.
+			// Existing live session: keep session_count stable.
 			sessionCountIncrement = 0
-			// Keep a stable bucket key for the full life of an active session.
-			bucketEpoch = session.LastBucketEpoch
 
 			if firstSeenEpoch < session.FirstSeenEpoch {
 				session.FirstSeenEpoch = firstSeenEpoch
@@ -983,7 +985,6 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 				FirstSeenEpoch:        firstSeenEpoch,
 				LastSeenEpoch:         lastSeenEpoch,
 				ReportedActiveSeconds: activeSeconds,
-				LastBucketEpoch:       bucketEpoch,
 				LastUpdatedEpoch:      lastSeenEpoch,
 			}
 		}
@@ -992,23 +993,28 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 			FirstSeenEpoch:        firstSeenEpoch,
 			LastSeenEpoch:         lastSeenEpoch,
 			ReportedActiveSeconds: activeSeconds,
-			LastBucketEpoch:       bucketEpoch,
 			LastUpdatedEpoch:      lastSeenEpoch,
 		}
 	}
 
 	key := metaRollupKey{
-		BucketEpoch: bucketEpoch,
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		SrcPort:     srcPort,
-		DstPort:     dstPort,
-		Interface:   iface,
-		SNI:         sni,
-		PID:         pid,
+		SrcIP:     srcIP,
+		DstIP:     dstIP,
+		SrcPort:   srcPort,
+		DstPort:   dstPort,
+		Interface: iface,
 	}
 
 	if entry, ok := a.metaRollups[key]; ok {
+		if bucketEpoch > entry.BucketEpoch {
+			entry.BucketEpoch = bucketEpoch
+		}
+		if sni != "" {
+			entry.SNI = sni
+		}
+		if pid > 0 {
+			entry.PID = pid
+		}
 		entry.ActiveSeconds += activeSecondsIncrement
 		entry.PacketsIn += packetsIn
 		entry.PacketsOut += packetsOut
@@ -1023,6 +1029,9 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	}
 
 	a.metaRollups[key] = &metaRollupAggregate{
+		BucketEpoch:    bucketEpoch,
+		SNI:            sni,
+		PID:            pid,
 		ActiveSeconds:  activeSecondsIncrement,
 		PacketsIn:      packetsIn,
 		PacketsOut:     packetsOut,
@@ -1518,8 +1527,8 @@ func epochSecondsFromAuto(v int64) int64 {
 		return 0
 	}
 	nowEpoch := time.Now().UTC().Unix()
-	const minUnixEpoch = 946684800  // 2000-01-01
-	const maxUnixEpoch = 4102444800 // 2100-01-01
+	const minUnixEpoch = 946684800                     // 2000-01-01
+	const maxUnixEpoch = 4102444800                    // 2100-01-01
 	const maxAcceptableSkew = int64(30 * 24 * 60 * 60) // 30 days
 
 	candidates := []int64{
