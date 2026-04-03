@@ -1520,6 +1520,7 @@ func epochSecondsFromAuto(v int64) int64 {
 	nowEpoch := time.Now().UTC().Unix()
 	const minUnixEpoch = 946684800  // 2000-01-01
 	const maxUnixEpoch = 4102444800 // 2100-01-01
+	const maxAcceptableSkew = int64(30 * 24 * 60 * 60) // 30 days
 
 	candidates := []int64{
 		v,                 // seconds
@@ -1541,7 +1542,7 @@ func epochSecondsFromAuto(v int64) int64 {
 		}
 	}
 
-	if best > 0 {
+	if best > 0 && bestDiff <= maxAcceptableSkew {
 		return best
 	}
 

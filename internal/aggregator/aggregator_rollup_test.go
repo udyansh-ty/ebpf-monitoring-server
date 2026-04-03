@@ -231,6 +231,18 @@ func TestEpochSecondsFromAutoHandlesMonotonicNanoseconds(t *testing.T) {
 	}
 }
 
+func TestEpochSecondsFromAutoMapsFarFutureDerivedValueToNow(t *testing.T) {
+	nowBefore := time.Now().UTC().Unix()
+	// This value can produce a "valid-looking" Unix epoch candidate in the future when
+	// interpreted as milliseconds, but should still map to now for real-time rollups.
+	converted := epochSecondsFromAuto(3238978635000)
+	nowAfter := time.Now().UTC().Unix()
+
+	if converted < nowBefore || converted > nowAfter {
+		t.Fatalf("expected far-future derived timestamp to map to now, got %d (expected between %d and %d)", converted, nowBefore, nowAfter)
+	}
+}
+
 func TestTrackMetaWindowRollupSkipsNonSessionConnectionEvents(t *testing.T) {
 	agg, err := New(&Config{})
 	if err != nil {
