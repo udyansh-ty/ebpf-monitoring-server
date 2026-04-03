@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/internal/storage"
@@ -106,14 +107,71 @@ func TestTrackMetaWindowRollupAggregatesByMinuteAndPair(t *testing.T) {
 	if entry.PacketsOut != 34 {
 		t.Fatalf("expected packets_out=34, got %d", entry.PacketsOut)
 	}
-	if entry.SessionCount != 2 {
-		t.Fatalf("expected session_count=2, got %d", entry.SessionCount)
+	if entry.SessionCount != 1 {
+		t.Fatalf("expected session_count=1 for same active session, got %d", entry.SessionCount)
 	}
 	if entry.FirstSeenEpoch != 1773919447 {
 		t.Fatalf("expected first_seen_epoch=1773919447, got %d", entry.FirstSeenEpoch)
 	}
 	if entry.LastSeenEpoch != 1773919478 {
 		t.Fatalf("expected last_seen_epoch=1773919478, got %d", entry.LastSeenEpoch)
+	}
+}
+
+func TestTrackMetaWindowRollupStartsNewSessionAfterTimeout(t *testing.T) {
+	agg, err := New(&Config{
+		MetaSessionTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	base := map[string]interface{}{
+		"type":        "connection",
+		"src_ip":      "192.168.1.25",
+		"dst_ip":      "142.250.183.69",
+		"duration_ms": float64(1000),
+	}
+
+	first := make(map[string]interface{}, len(base)+2)
+	for k, v := range base {
+		first[k] = v
+	}
+	first["session_start_ns"] = float64(1773919447000000000)
+	first["session_end_ns"] = float64(1773919448000000000)
+
+	second := make(map[string]interface{}, len(base)+2)
+	for k, v := range base {
+		second[k] = v
+	}
+	second["session_start_ns"] = float64(1773919450000000000)
+	second["session_end_ns"] = float64(1773919451000000000)
+
+	third := make(map[string]interface{}, len(base)+2)
+	for k, v := range base {
+		third[k] = v
+	}
+	third["session_start_ns"] = float64(1773919460000000000)
+	third["session_end_ns"] = float64(1773919461000000000)
+
+	agg.trackMetaWindowRollup(first)
+	agg.trackMetaWindowRollup(second)
+	agg.trackMetaWindowRollup(third)
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+
+	key := metaRollupKey{
+		BucketEpoch: 1773919440,
+		SrcIP:       "192.168.1.25",
+		DstIP:       "142.250.183.69",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for key %+v", key)
+	}
+	if entry.SessionCount != 2 {
+		t.Fatalf("expected session_count=2 after timeout boundary, got %d", entry.SessionCount)
 	}
 }
 

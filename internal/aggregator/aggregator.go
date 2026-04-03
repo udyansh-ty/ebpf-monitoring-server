@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -122,9 +123,10 @@ type Config struct {
 	HTTPAddr string
 	// ANCHOR: Aggregator Storage Injection - Bug: pgStorage unused - Feb 25, 2026
 	// Allow callers to supply a storage backend instead of always using memory.
-	Storage           core.EventSink
-	Enricher          *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
-	MetaFlushInterval time.Duration         // Periodic metadata rollup flush interval
+	Storage            core.EventSink
+	Enricher           *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
+	MetaFlushInterval  time.Duration         // Periodic metadata rollup flush interval
+	MetaSessionTimeout time.Duration         // Session timeout for metadata rollup keying
 }
 
 // ProgramCache caches program information to avoid expensive queries
@@ -136,16 +138,18 @@ type ProgramCache struct {
 
 // Aggregator collects and aggregates events from multiple eBPF agents.
 type Aggregator struct {
-	config       *Config
-	storage      core.EventSink
-	stats        *Stats
-	programCache *ProgramCache
-	enricher     *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
-	metaFlushInt time.Duration
-	metaRollups  map[metaRollupKey]*metaRollupAggregate
-	metaMu       sync.RWMutex
-	mu           sync.RWMutex
-	running      bool
+	config             *Config
+	storage            core.EventSink
+	stats              *Stats
+	programCache       *ProgramCache
+	enricher           *events.EventEnricher // Optional enricher for Phase 1B multi-NIC support
+	metaFlushInt       time.Duration
+	metaSessionTimeout time.Duration
+	metaRollups        map[metaRollupKey]*metaRollupAggregate
+	metaSessions       map[metaSessionKey]*metaSessionState
+	metaMu             sync.RWMutex
+	mu                 sync.RWMutex
+	running            bool
 }
 
 type metaRollupKey struct {
@@ -168,7 +172,26 @@ type metaRollupAggregate struct {
 	LastSeenEpoch  int64
 }
 
+type metaSessionKey struct {
+	SrcIP     string
+	DstIP     string
+	SrcPort   int64
+	DstPort   int64
+	Interface string
+	SNI       string
+	PID       int64
+}
+
+type metaSessionState struct {
+	FirstSeenEpoch        int64
+	LastSeenEpoch         int64
+	ReportedActiveSeconds int64
+	LastBucketEpoch       int64
+	LastUpdatedEpoch      int64
+}
+
 const defaultMetaFlushInterval = 30 * time.Second
+const defaultMetaSessionTimeout = 2 * time.Minute
 
 type metaWindowBatchWriter interface {
 	UpsertMetaWindowRows(ctx context.Context, rows []storage.EBPFMetaWindowRow) error
@@ -200,6 +223,10 @@ func New(config *Config) (*Aggregator, error) {
 	if metaFlushInt <= 0 {
 		metaFlushInt = defaultMetaFlushInterval
 	}
+	metaSessionTimeout := config.MetaSessionTimeout
+	if metaSessionTimeout <= 0 {
+		metaSessionTimeout = defaultMetaSessionTimeout
+	}
 
 	return &Aggregator{
 		config:  config,
@@ -209,10 +236,12 @@ func New(config *Config) (*Aggregator, error) {
 			EventsByNode: make(map[string]int64),
 			StartTime:    time.Now(),
 		},
-		programCache: &ProgramCache{},
-		enricher:     config.Enricher, // Use enricher from config (optional)
-		metaFlushInt: metaFlushInt,
-		metaRollups:  make(map[metaRollupKey]*metaRollupAggregate),
+		programCache:       &ProgramCache{},
+		enricher:           config.Enricher, // Use enricher from config (optional)
+		metaFlushInt:       metaFlushInt,
+		metaSessionTimeout: metaSessionTimeout,
+		metaRollups:        make(map[metaRollupKey]*metaRollupAggregate),
+		metaSessions:       make(map[metaSessionKey]*metaSessionState),
 	}, nil
 }
 
@@ -864,23 +893,21 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	if lastSeenEpoch < firstSeenEpoch {
 		firstSeenEpoch, lastSeenEpoch = lastSeenEpoch, firstSeenEpoch
 	}
-
-	bucketEpoch := lastSeenEpoch - (lastSeenEpoch % 60)
-	if bucketEpoch < 0 {
-		bucketEpoch = 0
+	activeSeconds := deriveActiveSeconds(metadataMaps, firstSeenEpoch, lastSeenEpoch)
+	explicitActiveMetric := hasExplicitActiveMetric(metadataMaps)
+	packetsIn, packetsOut := derivePacketCounters(metadataMaps)
+	if activeSeconds <= 0 && eventType == "connection" {
+		// Connection syscall events are point-in-time by default, so preserve a minimum
+		// active duration to avoid "always-zero" aggregates.
+		activeSeconds = 1
 	}
-
-	// Calculate active_seconds from time span (connection timeout detection)
-	// This is more reliable than waiting for explicit close events
-	activeSeconds := lastSeenEpoch - firstSeenEpoch
-	if activeSeconds < 0 {
-		activeSeconds = 0
+	if packetsIn == 0 && packetsOut == 0 && eventType == "connection" {
+		// Minimum packet heuristic for connect events when packet counters are absent.
+		packetsOut = 1
+		if returnCode, ok := getInt64FromMaps(metadataMaps, "return_code"); !ok || returnCode >= 0 {
+			packetsIn = 1
+		}
 	}
-
-	// For now, packets_in and packets_out are set to 0
-	// since packet counting at syscall level is unreliable
-	packetsIn := int64(0)
-	packetsOut := int64(0)
 	sni := extractSNI(metadataMaps)
 	srcPort := normalizePort(findFirstPort(metadataMaps, "src_port", "source_port", "sport"))
 	dstPort := normalizePort(findFirstPort(metadataMaps, "dst_port", "dest_port", "destination_port", "dport", "port"))
@@ -893,6 +920,84 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		dstPort = normalizePort(extractPortFromEndpoint(findFirstStringValue(metadataMaps, "destination", "dst_ip", "dest_ip", "destination_ip", "remote_addr", "dst_addr")))
 	}
 	iface := strings.TrimSpace(findFirstStringValue(metadataMaps, "interface_name", "interface", "iface"))
+	sessionKey := metaSessionKey{
+		SrcIP:     srcIP,
+		DstIP:     dstIP,
+		SrcPort:   srcPort,
+		DstPort:   dstPort,
+		Interface: iface,
+		SNI:       sni,
+		PID:       pid,
+	}
+
+	a.metaMu.Lock()
+	defer a.metaMu.Unlock()
+
+	a.pruneMetaSessionsLocked(lastSeenEpoch)
+
+	bucketEpoch := lastSeenEpoch - (lastSeenEpoch % 60)
+	if bucketEpoch < 0 {
+		bucketEpoch = 0
+	}
+
+	sessionCountIncrement := int64(1)
+	activeSecondsIncrement := activeSeconds
+
+	sessionTimeoutSeconds := int64(a.metaSessionTimeout / time.Second)
+	if sessionTimeoutSeconds <= 0 {
+		sessionTimeoutSeconds = int64(defaultMetaSessionTimeout / time.Second)
+	}
+
+	if session, ok := a.metaSessions[sessionKey]; ok && session != nil {
+		gap := lastSeenEpoch - session.LastSeenEpoch
+		if gap < 0 {
+			gap = 0
+		}
+		if gap <= sessionTimeoutSeconds {
+			// Existing live session: keep session_count stable unless we crossed into a new minute bucket.
+			sessionCountIncrement = 0
+			if bucketEpoch != session.LastBucketEpoch {
+				sessionCountIncrement = 1
+			}
+
+			if firstSeenEpoch < session.FirstSeenEpoch {
+				session.FirstSeenEpoch = firstSeenEpoch
+			}
+			if lastSeenEpoch > session.LastSeenEpoch {
+				session.LastSeenEpoch = lastSeenEpoch
+			}
+			if explicitActiveMetric {
+				activeSecondsIncrement = activeSeconds
+				session.ReportedActiveSeconds += activeSeconds
+			} else {
+				targetActive := maxInt64(activeSeconds, session.LastSeenEpoch-session.FirstSeenEpoch)
+				if targetActive > session.ReportedActiveSeconds {
+					activeSecondsIncrement = targetActive - session.ReportedActiveSeconds
+					session.ReportedActiveSeconds = targetActive
+				} else {
+					activeSecondsIncrement = 0
+				}
+			}
+			session.LastBucketEpoch = bucketEpoch
+			session.LastUpdatedEpoch = maxInt64(session.LastUpdatedEpoch, lastSeenEpoch)
+		} else {
+			a.metaSessions[sessionKey] = &metaSessionState{
+				FirstSeenEpoch:        firstSeenEpoch,
+				LastSeenEpoch:         lastSeenEpoch,
+				ReportedActiveSeconds: activeSeconds,
+				LastBucketEpoch:       bucketEpoch,
+				LastUpdatedEpoch:      lastSeenEpoch,
+			}
+		}
+	} else {
+		a.metaSessions[sessionKey] = &metaSessionState{
+			FirstSeenEpoch:        firstSeenEpoch,
+			LastSeenEpoch:         lastSeenEpoch,
+			ReportedActiveSeconds: activeSeconds,
+			LastBucketEpoch:       bucketEpoch,
+			LastUpdatedEpoch:      lastSeenEpoch,
+		}
+	}
 
 	key := metaRollupKey{
 		BucketEpoch: bucketEpoch,
@@ -905,14 +1010,11 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		PID:         pid,
 	}
 
-	a.metaMu.Lock()
-	defer a.metaMu.Unlock()
-
 	if entry, ok := a.metaRollups[key]; ok {
-		entry.ActiveSeconds += activeSeconds
+		entry.ActiveSeconds += activeSecondsIncrement
 		entry.PacketsIn += packetsIn
 		entry.PacketsOut += packetsOut
-		entry.SessionCount++
+		entry.SessionCount += sessionCountIncrement
 		if firstSeenEpoch < entry.FirstSeenEpoch {
 			entry.FirstSeenEpoch = firstSeenEpoch
 		}
@@ -923,13 +1025,118 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	}
 
 	a.metaRollups[key] = &metaRollupAggregate{
-		ActiveSeconds:  activeSeconds,
+		ActiveSeconds:  activeSecondsIncrement,
 		PacketsIn:      packetsIn,
 		PacketsOut:     packetsOut,
-		SessionCount:   1,
+		SessionCount:   sessionCountIncrement,
 		FirstSeenEpoch: firstSeenEpoch,
 		LastSeenEpoch:  lastSeenEpoch,
 	}
+}
+
+func (a *Aggregator) pruneMetaSessionsLocked(nowEpoch int64) {
+	if len(a.metaSessions) == 0 || nowEpoch <= 0 {
+		return
+	}
+	ttlSeconds := int64((a.metaSessionTimeout * 3) / time.Second)
+	if ttlSeconds <= 0 {
+		ttlSeconds = int64((defaultMetaSessionTimeout * 3) / time.Second)
+	}
+	cutoff := nowEpoch - ttlSeconds
+	for key, session := range a.metaSessions {
+		if session == nil {
+			delete(a.metaSessions, key)
+			continue
+		}
+		lastUpdated := session.LastUpdatedEpoch
+		if lastUpdated == 0 {
+			lastUpdated = session.LastSeenEpoch
+		}
+		if lastUpdated > 0 && lastUpdated < cutoff {
+			delete(a.metaSessions, key)
+		}
+	}
+}
+
+func deriveActiveSeconds(metadataMaps []map[string]interface{}, firstSeenEpoch, lastSeenEpoch int64) int64 {
+	if activeSeconds, ok := getInt64FromMaps(metadataMaps, "active_seconds"); ok && activeSeconds > 0 {
+		return activeSeconds
+	}
+	if durationMS, ok := getFloat64FromMaps(metadataMaps, "duration_ms"); ok && durationMS > 0 {
+		seconds := int64(math.Ceil(durationMS / 1000.0))
+		if seconds < 1 {
+			return 1
+		}
+		return seconds
+	}
+	if durationSeconds, ok := getFloat64FromMaps(metadataMaps, "duration_seconds", "duration_sec"); ok && durationSeconds > 0 {
+		seconds := int64(math.Ceil(durationSeconds))
+		if seconds < 1 {
+			return 1
+		}
+		return seconds
+	}
+	if lastSeenEpoch > firstSeenEpoch {
+		return lastSeenEpoch - firstSeenEpoch
+	}
+	return 0
+}
+
+func hasExplicitActiveMetric(metadataMaps []map[string]interface{}) bool {
+	if value, ok := getFloat64FromMaps(metadataMaps, "active_seconds"); ok && value > 0 {
+		return true
+	}
+	if value, ok := getFloat64FromMaps(metadataMaps, "duration_ms", "duration_seconds", "duration_sec"); ok && value > 0 {
+		return true
+	}
+	return false
+}
+
+func derivePacketCounters(metadataMaps []map[string]interface{}) (int64, int64) {
+	packetsIn := firstPositiveInt64FromMaps(metadataMaps,
+		"packets_in", "packets_incoming", "incoming_packets", "in_packets", "rx_packets",
+	)
+	packetsOut := firstPositiveInt64FromMaps(metadataMaps,
+		"packets_out", "packets_outgoing", "outgoing_packets", "out_packets", "tx_packets",
+	)
+	if packetsIn > 0 || packetsOut > 0 {
+		return packetsIn, packetsOut
+	}
+
+	bytesIn := firstPositiveInt64FromMaps(metadataMaps,
+		"bytes_received", "rx_bytes", "bytes_in", "incoming_bytes",
+	)
+	bytesOut := firstPositiveInt64FromMaps(metadataMaps,
+		"bytes_sent", "tx_bytes", "bytes_out", "outgoing_bytes",
+	)
+	if bytesIn > 0 {
+		packetsIn = estimatePacketsFromBytes(bytesIn)
+	}
+	if bytesOut > 0 {
+		packetsOut = estimatePacketsFromBytes(bytesOut)
+	}
+	return packetsIn, packetsOut
+}
+
+func firstPositiveInt64FromMaps(metadataMaps []map[string]interface{}, keys ...string) int64 {
+	if value, ok := getInt64FromMaps(metadataMaps, keys...); ok && value > 0 {
+		return value
+	}
+	if value, ok := getFloat64FromMaps(metadataMaps, keys...); ok && value > 0 {
+		return int64(math.Round(value))
+	}
+	return 0
+}
+
+func estimatePacketsFromBytes(bytes int64) int64 {
+	if bytes <= 0 {
+		return 0
+	}
+	packets := int64(math.Ceil(float64(bytes) / 1500.0))
+	if packets < 1 {
+		return 1
+	}
+	return packets
 }
 
 func collectMetadataMaps(metadata map[string]interface{}) []map[string]interface{} {
@@ -1066,6 +1273,18 @@ func getInt64FromMaps(metadataMaps []map[string]interface{}, keys ...string) (in
 			continue
 		}
 		if value, ok := getInt64Value(metadata, keys...); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func getFloat64FromMaps(metadataMaps []map[string]interface{}, keys ...string) (float64, bool) {
+	for _, metadata := range metadataMaps {
+		if metadata == nil {
+			continue
+		}
+		if value, ok := getFloat64Value(metadata, keys...); ok {
 			return value, true
 		}
 	}
@@ -1243,6 +1462,57 @@ func getInt64Value(metadata map[string]interface{}, keys ...string) (int64, bool
 		}
 	}
 	return 0, false
+}
+
+func getFloat64Value(metadata map[string]interface{}, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		raw, ok := metadata[key]
+		if !ok {
+			continue
+		}
+		switch v := raw.(type) {
+		case int:
+			return float64(v), true
+		case int8:
+			return float64(v), true
+		case int16:
+			return float64(v), true
+		case int32:
+			return float64(v), true
+		case int64:
+			return float64(v), true
+		case uint:
+			return float64(v), true
+		case uint8:
+			return float64(v), true
+		case uint16:
+			return float64(v), true
+		case uint32:
+			return float64(v), true
+		case uint64:
+			return float64(v), true
+		case float32:
+			return float64(v), true
+		case float64:
+			return v, true
+		case json.Number:
+			if parsed, err := v.Float64(); err == nil {
+				return parsed, true
+			}
+		case string:
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func epochSecondsFromAuto(v int64) int64 {

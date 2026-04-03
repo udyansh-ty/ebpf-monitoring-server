@@ -27,6 +27,7 @@ func main() {
 		dbURL           = flag.String("db-url", os.Getenv("DB_URL"), "PostgreSQL connection string (optional)")
 		flowCacheTTL    = flag.Duration("flow-cache-ttl", 5*time.Minute, "Flow cache TTL for interface mapping (Phase 1B)")
 		metaFlushInt    = flag.Duration("meta-flush-interval", 30*time.Second, "Metadata rollup flush interval")
+		metaSessionTO   = flag.Duration("meta-session-timeout", 2*time.Minute, "Metadata rollup session timeout")
 		disableEnricher = flag.Bool("disable-enricher", false, "Disable event enricher (for testing)")
 	)
 	flag.Parse()
@@ -107,10 +108,11 @@ func main() {
 	// Ensure the aggregator uses PostgreSQL storage when DB_URL is provided.
 	// Create aggregator
 	agg, err := aggregator.New(&aggregator.Config{
-		HTTPAddr:          *httpAddr,
-		Storage:           pgStorage,
-		Enricher:          enricher, // Pass enricher to aggregator for event pipeline integration (Phase 1B)
-		MetaFlushInterval: *metaFlushInt,
+		HTTPAddr:           *httpAddr,
+		Storage:            pgStorage,
+		Enricher:           enricher, // Pass enricher to aggregator for event pipeline integration (Phase 1B)
+		MetaFlushInterval:  *metaFlushInt,
+		MetaSessionTimeout: *metaSessionTO,
 	})
 	if err != nil {
 		logger.Fatalf("Failed to create aggregator: %v", err)
