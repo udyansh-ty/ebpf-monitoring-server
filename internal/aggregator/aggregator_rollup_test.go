@@ -84,7 +84,6 @@ func TestTrackMetaWindowRollupAggregatesByMinuteAndPair(t *testing.T) {
 
 	agg.metaMu.RLock()
 	defer agg.metaMu.RUnlock()
-
 	if len(agg.metaRollups) != 1 {
 		t.Fatalf("expected 1 rollup key, got %d", len(agg.metaRollups))
 	}
@@ -171,7 +170,64 @@ func TestTrackMetaWindowRollupStartsNewSessionAfterTimeout(t *testing.T) {
 		t.Fatalf("expected rollup entry for key %+v", key)
 	}
 	if entry.SessionCount != 2 {
-		t.Fatalf("expected session_count=2 after timeout boundary, got %d", entry.SessionCount)
+		t.Fatalf("expected first bucket session_count=2 after timeout boundary in same minute, got %d", entry.SessionCount)
+	}
+}
+
+func TestTrackMetaWindowRollupKeepsBucketStableForActiveSession(t *testing.T) {
+	agg, err := New(&Config{
+		MetaSessionTimeout: 2 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"type":             "connection",
+		"src_ip":           "192.168.1.25",
+		"dst_ip":           "142.250.183.69",
+		"session_start_ns": float64(1773919447000000000),
+		"session_end_ns":   float64(1773919448000000000),
+		"duration_ms":      float64(1000),
+	})
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"type":             "connection",
+		"src_ip":           "192.168.1.25",
+		"dst_ip":           "142.250.183.69",
+		"session_start_ns": float64(1773919510000000000), // Next minute, same live session
+		"session_end_ns":   float64(1773919511000000000),
+		"duration_ms":      float64(1000),
+	})
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected single rollup key for active session, got %d", len(agg.metaRollups))
+	}
+
+	key := metaRollupKey{
+		BucketEpoch: 1773919440,
+		SrcIP:       "192.168.1.25",
+		DstIP:       "142.250.183.69",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for stable session bucket key %+v", key)
+	}
+	if entry.SessionCount != 1 {
+		t.Fatalf("expected session_count=1 for active session bucket, got %d", entry.SessionCount)
+	}
+}
+
+func TestEpochSecondsFromAutoHandlesMonotonicNanoseconds(t *testing.T) {
+	nowBefore := time.Now().UTC().Unix()
+	converted := epochSecondsFromAuto(942819672957)
+	nowAfter := time.Now().UTC().Unix()
+
+	if converted < nowBefore || converted > nowAfter {
+		t.Fatalf("expected monotonic timestamp to map to now, got %d (expected between %d and %d)", converted, nowBefore, nowAfter)
 	}
 }
 

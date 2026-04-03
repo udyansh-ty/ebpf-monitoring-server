@@ -935,7 +935,7 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 
 	a.pruneMetaSessionsLocked(lastSeenEpoch)
 
-	bucketEpoch := lastSeenEpoch - (lastSeenEpoch % 60)
+	bucketEpoch := firstSeenEpoch - (firstSeenEpoch % 60)
 	if bucketEpoch < 0 {
 		bucketEpoch = 0
 	}
@@ -956,9 +956,8 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		if gap <= sessionTimeoutSeconds {
 			// Existing live session: keep session_count stable unless we crossed into a new minute bucket.
 			sessionCountIncrement = 0
-			if bucketEpoch != session.LastBucketEpoch {
-				sessionCountIncrement = 1
-			}
+			// Keep a stable bucket key for the full life of an active session.
+			bucketEpoch = session.LastBucketEpoch
 
 			if firstSeenEpoch < session.FirstSeenEpoch {
 				session.FirstSeenEpoch = firstSeenEpoch
@@ -978,7 +977,6 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 					activeSecondsIncrement = 0
 				}
 			}
-			session.LastBucketEpoch = bucketEpoch
 			session.LastUpdatedEpoch = maxInt64(session.LastUpdatedEpoch, lastSeenEpoch)
 		} else {
 			a.metaSessions[sessionKey] = &metaSessionState{
@@ -1519,24 +1517,44 @@ func epochSecondsFromAuto(v int64) int64 {
 	if v <= 0 {
 		return 0
 	}
-	var seconds int64
-	switch {
-	case v >= 1_000_000_000_000_000: // nanoseconds
-		seconds = v / int64(time.Second)
-	case v >= 1_000_000_000_000: // milliseconds
-		seconds = v / int64(time.Millisecond)
-	default: // seconds
-		seconds = v
+	nowEpoch := time.Now().UTC().Unix()
+	const minUnixEpoch = 946684800  // 2000-01-01
+	const maxUnixEpoch = 4102444800 // 2100-01-01
+
+	candidates := []int64{
+		v,                 // seconds
+		v / 1_000,         // milliseconds
+		v / 1_000_000,     // microseconds
+		v / 1_000_000_000, // nanoseconds
 	}
 
-	// Kernel tracepoints frequently emit monotonic timestamps (seconds since boot),
-	// not Unix epoch seconds. These values are typically far below year-2000 epoch.
-	// Map them to "now" so rollup bucketing stays aligned with wall-clock time.
-	if seconds > 0 && seconds < 946684800 {
-		return time.Now().UTC().Unix()
+	best := int64(0)
+	bestDiff := int64(^uint64(0) >> 1) // max int64
+	for _, candidate := range candidates {
+		if candidate < minUnixEpoch || candidate > maxUnixEpoch {
+			continue
+		}
+		diff := absInt64(candidate - nowEpoch)
+		if diff < bestDiff {
+			bestDiff = diff
+			best = candidate
+		}
 	}
 
-	return seconds
+	if best > 0 {
+		return best
+	}
+
+	// Monotonic/boot-relative timestamps are mapped to wall-clock "now"
+	// so repeated flow events can be bucketed into stable session windows.
+	return nowEpoch
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // updateStats updates aggregation statistics.
