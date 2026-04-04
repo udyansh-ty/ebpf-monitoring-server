@@ -34,20 +34,36 @@ type PostgreSQLStorage struct {
 
 // EBPFMetaWindowRow represents one aggregated metadata row for ebpf_meta_window.
 type EBPFMetaWindowRow struct {
-	BucketEpoch    int64
-	SrcIP          string
-	DstIP          string
-	SrcPort        int64
-	DstPort        int64
-	InterfaceName  string
-	SNI            string
-	PID            int64
-	ActiveSeconds  int64
-	PacketsIn      int64
-	PacketsOut     int64
-	SessionCount   int64
-	FirstSeenEpoch int64
-	LastSeenEpoch  int64
+	BucketEpoch     int64
+	SrcIP           string
+	DstIP           string
+	SrcPort         int64
+	DstPort         int64
+	InterfaceName   string
+	Protocol        string
+	SNI             string
+	PID             int64
+	UID             int64
+	GID             int64
+	ConnectionState string
+	Action          string
+	RuleID          string
+	PolicyID        string
+	DropReason      string
+	DecisionReason  string
+	L7Protocol      string
+	Command         string
+	Namespace       string
+	ActiveSeconds   int64
+	PacketsIn       int64
+	PacketsOut      int64
+	BytesIn         int64
+	BytesOut        int64
+	Retransmissions int64
+	Drops           int64
+	SessionCount    int64
+	FirstSeenEpoch  int64
+	LastSeenEpoch   int64
 }
 
 // UpsertMetaWindowRows persists aggregated metadata rows into ebpf_meta_window.
@@ -65,15 +81,19 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 
 	sql := `
 		INSERT INTO ebpf_meta_window (
-			bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, sni, pid,
-			active_seconds, packets_in, packets_out, session_count,
+			bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, protocol,
+			sni, pid, uid, gid, connection_state, action, rule_id, policy_id,
+			drop_reason, decision_reason, l7_protocol, command, namespace,
+			active_seconds, packets_in, packets_out, bytes_in, bytes_out, retransmissions, drops, session_count,
 			first_seen_epoch, last_seen_epoch
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8,
-			$9, $10, $11, $12,
-			$13, $14
+			$1, $2, $3, $4, $5, $6, $7,
+			$8, $9, $10, $11, $12, $13, $14, $15,
+			$16, $17, $18, $19, $20,
+			$21, $22, $23, $24, $25, $26, $27, $28,
+			$29, $30
 		)
-		ON CONFLICT (src_ip, dst_ip, src_port, dst_port, interface_name) DO UPDATE SET
+		ON CONFLICT (src_ip, dst_ip, src_port, dst_port, interface_name, protocol) DO UPDATE SET
 			bucket_epoch = GREATEST(ebpf_meta_window.bucket_epoch, EXCLUDED.bucket_epoch),
 			sni = CASE
 				WHEN EXCLUDED.sni <> '' THEN EXCLUDED.sni
@@ -83,9 +103,57 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 				WHEN EXCLUDED.pid > 0 THEN EXCLUDED.pid
 				ELSE ebpf_meta_window.pid
 			END,
+			uid = CASE
+				WHEN EXCLUDED.uid > 0 THEN EXCLUDED.uid
+				ELSE ebpf_meta_window.uid
+			END,
+			gid = CASE
+				WHEN EXCLUDED.gid > 0 THEN EXCLUDED.gid
+				ELSE ebpf_meta_window.gid
+			END,
+			connection_state = CASE
+				WHEN EXCLUDED.connection_state <> '' THEN EXCLUDED.connection_state
+				ELSE ebpf_meta_window.connection_state
+			END,
+			action = CASE
+				WHEN EXCLUDED.action <> '' THEN EXCLUDED.action
+				ELSE ebpf_meta_window.action
+			END,
+			rule_id = CASE
+				WHEN EXCLUDED.rule_id <> '' THEN EXCLUDED.rule_id
+				ELSE ebpf_meta_window.rule_id
+			END,
+			policy_id = CASE
+				WHEN EXCLUDED.policy_id <> '' THEN EXCLUDED.policy_id
+				ELSE ebpf_meta_window.policy_id
+			END,
+			drop_reason = CASE
+				WHEN EXCLUDED.drop_reason <> '' THEN EXCLUDED.drop_reason
+				ELSE ebpf_meta_window.drop_reason
+			END,
+			decision_reason = CASE
+				WHEN EXCLUDED.decision_reason <> '' THEN EXCLUDED.decision_reason
+				ELSE ebpf_meta_window.decision_reason
+			END,
+			l7_protocol = CASE
+				WHEN EXCLUDED.l7_protocol <> '' THEN EXCLUDED.l7_protocol
+				ELSE ebpf_meta_window.l7_protocol
+			END,
+			command = CASE
+				WHEN EXCLUDED.command <> '' THEN EXCLUDED.command
+				ELSE ebpf_meta_window.command
+			END,
+			namespace = CASE
+				WHEN EXCLUDED.namespace <> '' THEN EXCLUDED.namespace
+				ELSE ebpf_meta_window.namespace
+			END,
 			active_seconds = ebpf_meta_window.active_seconds + EXCLUDED.active_seconds,
 			packets_in = ebpf_meta_window.packets_in + EXCLUDED.packets_in,
 			packets_out = ebpf_meta_window.packets_out + EXCLUDED.packets_out,
+			bytes_in = ebpf_meta_window.bytes_in + EXCLUDED.bytes_in,
+			bytes_out = ebpf_meta_window.bytes_out + EXCLUDED.bytes_out,
+			retransmissions = ebpf_meta_window.retransmissions + EXCLUDED.retransmissions,
+			drops = ebpf_meta_window.drops + EXCLUDED.drops,
 			session_count = ebpf_meta_window.session_count + EXCLUDED.session_count,
 			first_seen_epoch = LEAST(ebpf_meta_window.first_seen_epoch, EXCLUDED.first_seen_epoch),
 			last_seen_epoch = GREATEST(ebpf_meta_window.last_seen_epoch, EXCLUDED.last_seen_epoch)
@@ -102,8 +170,10 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 	batch := &pgx.Batch{}
 	for _, row := range rows {
 		batch.Queue(sql,
-			row.BucketEpoch, row.SrcIP, row.DstIP, row.SrcPort, row.DstPort, row.InterfaceName, row.SNI, row.PID,
-			row.ActiveSeconds, row.PacketsIn, row.PacketsOut, row.SessionCount,
+			row.BucketEpoch, row.SrcIP, row.DstIP, row.SrcPort, row.DstPort, row.InterfaceName, row.Protocol,
+			row.SNI, row.PID, row.UID, row.GID, row.ConnectionState, row.Action, row.RuleID, row.PolicyID,
+			row.DropReason, row.DecisionReason, row.L7Protocol, row.Command, row.Namespace,
+			row.ActiveSeconds, row.PacketsIn, row.PacketsOut, row.BytesIn, row.BytesOut, row.Retransmissions, row.Drops, row.SessionCount,
 			row.FirstSeenEpoch, row.LastSeenEpoch,
 		)
 	}
