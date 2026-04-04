@@ -158,18 +158,34 @@ type metaRollupKey struct {
 	SrcPort   int64
 	DstPort   int64
 	Interface string
+	Protocol  string
 }
 
 type metaRollupAggregate struct {
-	BucketEpoch    int64
-	SNI            string
-	PID            int64
-	ActiveSeconds  int64
-	PacketsIn      int64
-	PacketsOut     int64
-	SessionCount   int64
-	FirstSeenEpoch int64
-	LastSeenEpoch  int64
+	BucketEpoch     int64
+	SNI             string
+	PID             int64
+	UID             int64
+	GID             int64
+	ConnectionState string
+	Action          string
+	RuleID          string
+	PolicyID        string
+	DropReason      string
+	DecisionReason  string
+	L7Protocol      string
+	Command         string
+	Namespace       string
+	ActiveSeconds   int64
+	PacketsIn       int64
+	PacketsOut      int64
+	BytesIn         int64
+	BytesOut        int64
+	Retransmissions int64
+	Drops           int64
+	SessionCount    int64
+	FirstSeenEpoch  int64
+	LastSeenEpoch   int64
 }
 
 type metaSessionKey struct {
@@ -178,6 +194,7 @@ type metaSessionKey struct {
 	SrcPort   int64
 	DstPort   int64
 	Interface string
+	Protocol  string
 }
 
 type metaSessionState struct {
@@ -685,20 +702,36 @@ func (a *Aggregator) drainMetaRollups() []storage.EBPFMetaWindowRow {
 		}
 
 		rows = append(rows, storage.EBPFMetaWindowRow{
-			BucketEpoch:    entry.BucketEpoch,
-			SrcIP:          key.SrcIP,
-			DstIP:          key.DstIP,
-			SrcPort:        key.SrcPort,
-			DstPort:        key.DstPort,
-			InterfaceName:  key.Interface,
-			SNI:            entry.SNI,
-			PID:            entry.PID,
-			ActiveSeconds:  entry.ActiveSeconds,
-			PacketsIn:      entry.PacketsIn,
-			PacketsOut:     entry.PacketsOut,
-			SessionCount:   entry.SessionCount,
-			FirstSeenEpoch: entry.FirstSeenEpoch,
-			LastSeenEpoch:  entry.LastSeenEpoch,
+			BucketEpoch:     entry.BucketEpoch,
+			SrcIP:           key.SrcIP,
+			DstIP:           key.DstIP,
+			SrcPort:         key.SrcPort,
+			DstPort:         key.DstPort,
+			InterfaceName:   key.Interface,
+			Protocol:        key.Protocol,
+			SNI:             entry.SNI,
+			PID:             entry.PID,
+			UID:             entry.UID,
+			GID:             entry.GID,
+			ConnectionState: entry.ConnectionState,
+			Action:          entry.Action,
+			RuleID:          entry.RuleID,
+			PolicyID:        entry.PolicyID,
+			DropReason:      entry.DropReason,
+			DecisionReason:  entry.DecisionReason,
+			L7Protocol:      entry.L7Protocol,
+			Command:         entry.Command,
+			Namespace:       entry.Namespace,
+			ActiveSeconds:   entry.ActiveSeconds,
+			PacketsIn:       entry.PacketsIn,
+			PacketsOut:      entry.PacketsOut,
+			BytesIn:         entry.BytesIn,
+			BytesOut:        entry.BytesOut,
+			Retransmissions: entry.Retransmissions,
+			Drops:           entry.Drops,
+			SessionCount:    entry.SessionCount,
+			FirstSeenEpoch:  entry.FirstSeenEpoch,
+			LastSeenEpoch:   entry.LastSeenEpoch,
 		})
 	}
 
@@ -720,6 +753,7 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 			SrcPort:   row.SrcPort,
 			DstPort:   row.DstPort,
 			Interface: strings.TrimSpace(row.InterfaceName),
+			Protocol:  normalizeProtocol(row.Protocol),
 		}
 
 		if existing, ok := a.metaRollups[key]; ok {
@@ -732,9 +766,46 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 			if row.PID > 0 {
 				existing.PID = row.PID
 			}
+			if row.UID > 0 {
+				existing.UID = row.UID
+			}
+			if row.GID > 0 {
+				existing.GID = row.GID
+			}
+			if row.ConnectionState != "" {
+				existing.ConnectionState = row.ConnectionState
+			}
+			if row.Action != "" {
+				existing.Action = row.Action
+			}
+			if row.RuleID != "" {
+				existing.RuleID = row.RuleID
+			}
+			if row.PolicyID != "" {
+				existing.PolicyID = row.PolicyID
+			}
+			if row.DropReason != "" {
+				existing.DropReason = row.DropReason
+			}
+			if row.DecisionReason != "" {
+				existing.DecisionReason = row.DecisionReason
+			}
+			if row.L7Protocol != "" {
+				existing.L7Protocol = row.L7Protocol
+			}
+			if row.Command != "" {
+				existing.Command = row.Command
+			}
+			if row.Namespace != "" {
+				existing.Namespace = row.Namespace
+			}
 			existing.ActiveSeconds += row.ActiveSeconds
 			existing.PacketsIn += row.PacketsIn
 			existing.PacketsOut += row.PacketsOut
+			existing.BytesIn += row.BytesIn
+			existing.BytesOut += row.BytesOut
+			existing.Retransmissions += row.Retransmissions
+			existing.Drops += row.Drops
 			existing.SessionCount += row.SessionCount
 			if existing.FirstSeenEpoch == 0 || (row.FirstSeenEpoch > 0 && row.FirstSeenEpoch < existing.FirstSeenEpoch) {
 				existing.FirstSeenEpoch = row.FirstSeenEpoch
@@ -746,15 +817,30 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 		}
 
 		a.metaRollups[key] = &metaRollupAggregate{
-			BucketEpoch:    row.BucketEpoch,
-			SNI:            row.SNI,
-			PID:            row.PID,
-			ActiveSeconds:  row.ActiveSeconds,
-			PacketsIn:      row.PacketsIn,
-			PacketsOut:     row.PacketsOut,
-			SessionCount:   row.SessionCount,
-			FirstSeenEpoch: row.FirstSeenEpoch,
-			LastSeenEpoch:  row.LastSeenEpoch,
+			BucketEpoch:     row.BucketEpoch,
+			SNI:             row.SNI,
+			PID:             row.PID,
+			UID:             row.UID,
+			GID:             row.GID,
+			ConnectionState: row.ConnectionState,
+			Action:          row.Action,
+			RuleID:          row.RuleID,
+			PolicyID:        row.PolicyID,
+			DropReason:      row.DropReason,
+			DecisionReason:  row.DecisionReason,
+			L7Protocol:      row.L7Protocol,
+			Command:         row.Command,
+			Namespace:       row.Namespace,
+			ActiveSeconds:   row.ActiveSeconds,
+			PacketsIn:       row.PacketsIn,
+			PacketsOut:      row.PacketsOut,
+			BytesIn:         row.BytesIn,
+			BytesOut:        row.BytesOut,
+			Retransmissions: row.Retransmissions,
+			Drops:           row.Drops,
+			SessionCount:    row.SessionCount,
+			FirstSeenEpoch:  row.FirstSeenEpoch,
+			LastSeenEpoch:   row.LastSeenEpoch,
 		}
 	}
 }
@@ -901,17 +987,23 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	}
 	activeSeconds := deriveActiveSeconds(metadataMaps, firstSeenEpoch, lastSeenEpoch)
 	explicitActiveMetric := hasExplicitActiveMetric(metadataMaps)
-	packetsIn, packetsOut := derivePacketCounters(metadataMaps)
+	packetsIn, packetsOut, bytesIn, bytesOut := deriveTrafficCounters(metadataMaps)
 	if activeSeconds <= 0 && eventType == "connection" {
 		// Connection syscall events are point-in-time by default, so preserve a minimum
 		// active duration to avoid "always-zero" aggregates.
 		activeSeconds = 1
 	}
-	if packetsIn == 0 && packetsOut == 0 && eventType == "connection" {
+	if packetsIn == 0 && packetsOut == 0 && bytesIn == 0 && bytesOut == 0 && eventType == "connection" {
 		// Minimum packet heuristic for connect events when packet counters are absent.
 		packetsOut = 1
 		if returnCode, ok := getInt64FromMaps(metadataMaps, "return_code"); !ok || returnCode >= 0 {
 			packetsIn = 1
+		}
+	}
+	protocol := normalizeProtocol(findFirstStringValue(metadataMaps, "protocol", "l4_protocol", "transport_protocol", "transport", "proto"))
+	if protocol == "" {
+		if rawProto, ok := getInt64FromMaps(metadataMaps, "raw_protocol", "protocol_number", "ip_proto"); ok {
+			protocol = normalizeProtocolFromNumber(rawProto)
 		}
 	}
 	sni := extractSNI(metadataMaps)
@@ -919,6 +1011,19 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	dstPort := normalizePort(findFirstPort(metadataMaps, "dst_port", "dest_port", "destination_port", "dport", "port"))
 	pid, _ := getInt64FromMaps(metadataMaps, "pid", "process_id", "tgid")
 	pid = normalizePID(pid)
+	uid := normalizeUIDGID(firstPositiveInt64FromMaps(metadataMaps, "uid", "user_id", "euid"))
+	gid := normalizeUIDGID(firstPositiveInt64FromMaps(metadataMaps, "gid", "group_id", "egid"))
+	connectionState := normalizeLabel(findFirstStringValue(metadataMaps, "connection_state", "conn_state", "state", "tcp_state"))
+	action := normalizeLabel(findFirstStringValue(metadataMaps, "action", "verdict_action", "firewall_action", "decision_action"))
+	ruleID := strings.TrimSpace(findFirstStringValue(metadataMaps, "rule_id", "verdict_rule_id", "firewall_rule_id"))
+	policyID := strings.TrimSpace(findFirstStringValue(metadataMaps, "policy_id", "security_policy_id"))
+	dropReason := normalizeLabel(findFirstStringValue(metadataMaps, "drop_reason", "drop_reason_code", "reason"))
+	decisionReason := normalizeLabel(findFirstStringValue(metadataMaps, "decision_reason", "verdict_reason", "policy_reason"))
+	l7Protocol := normalizeLabel(findFirstStringValue(metadataMaps, "l7_protocol", "application_protocol", "ndpi_protocol"))
+	command := strings.TrimSpace(findFirstStringValue(metadataMaps, "command", "process_name", "comm"))
+	namespace := strings.TrimSpace(findFirstStringValue(metadataMaps, "namespace", "k8s_namespace", "pod_namespace"))
+	retransmissions := firstPositiveInt64FromMaps(metadataMaps, "retransmissions", "tcp_retransmissions", "retransmit_count")
+	drops := firstPositiveInt64FromMaps(metadataMaps, "drops", "drop_count", "packet_drops")
 	if srcPort == 0 {
 		srcPort = normalizePort(extractPortFromEndpoint(findFirstStringValue(metadataMaps, "src_ip", "source_ip", "source_addr", "src_addr")))
 	}
@@ -932,6 +1037,7 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		SrcPort:   srcPort,
 		DstPort:   dstPort,
 		Interface: iface,
+		Protocol:  protocol,
 	}
 
 	a.metaMu.Lock()
@@ -1003,6 +1109,7 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		SrcPort:   srcPort,
 		DstPort:   dstPort,
 		Interface: iface,
+		Protocol:  protocol,
 	}
 
 	if entry, ok := a.metaRollups[key]; ok {
@@ -1015,9 +1122,46 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		if pid > 0 {
 			entry.PID = pid
 		}
+		if uid > 0 {
+			entry.UID = uid
+		}
+		if gid > 0 {
+			entry.GID = gid
+		}
+		if connectionState != "" {
+			entry.ConnectionState = connectionState
+		}
+		if action != "" {
+			entry.Action = action
+		}
+		if ruleID != "" {
+			entry.RuleID = ruleID
+		}
+		if policyID != "" {
+			entry.PolicyID = policyID
+		}
+		if dropReason != "" {
+			entry.DropReason = dropReason
+		}
+		if decisionReason != "" {
+			entry.DecisionReason = decisionReason
+		}
+		if l7Protocol != "" {
+			entry.L7Protocol = l7Protocol
+		}
+		if command != "" {
+			entry.Command = command
+		}
+		if namespace != "" {
+			entry.Namespace = namespace
+		}
 		entry.ActiveSeconds += activeSecondsIncrement
 		entry.PacketsIn += packetsIn
 		entry.PacketsOut += packetsOut
+		entry.BytesIn += bytesIn
+		entry.BytesOut += bytesOut
+		entry.Retransmissions += retransmissions
+		entry.Drops += drops
 		entry.SessionCount += sessionCountIncrement
 		if firstSeenEpoch < entry.FirstSeenEpoch {
 			entry.FirstSeenEpoch = firstSeenEpoch
@@ -1029,15 +1173,30 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	}
 
 	a.metaRollups[key] = &metaRollupAggregate{
-		BucketEpoch:    bucketEpoch,
-		SNI:            sni,
-		PID:            pid,
-		ActiveSeconds:  activeSecondsIncrement,
-		PacketsIn:      packetsIn,
-		PacketsOut:     packetsOut,
-		SessionCount:   sessionCountIncrement,
-		FirstSeenEpoch: firstSeenEpoch,
-		LastSeenEpoch:  lastSeenEpoch,
+		BucketEpoch:     bucketEpoch,
+		SNI:             sni,
+		PID:             pid,
+		UID:             uid,
+		GID:             gid,
+		ConnectionState: connectionState,
+		Action:          action,
+		RuleID:          ruleID,
+		PolicyID:        policyID,
+		DropReason:      dropReason,
+		DecisionReason:  decisionReason,
+		L7Protocol:      l7Protocol,
+		Command:         command,
+		Namespace:       namespace,
+		ActiveSeconds:   activeSecondsIncrement,
+		PacketsIn:       packetsIn,
+		PacketsOut:      packetsOut,
+		BytesIn:         bytesIn,
+		BytesOut:        bytesOut,
+		Retransmissions: retransmissions,
+		Drops:           drops,
+		SessionCount:    sessionCountIncrement,
+		FirstSeenEpoch:  firstSeenEpoch,
+		LastSeenEpoch:   lastSeenEpoch,
 	}
 }
 
@@ -1099,30 +1258,26 @@ func hasExplicitActiveMetric(metadataMaps []map[string]interface{}) bool {
 	return false
 }
 
-func derivePacketCounters(metadataMaps []map[string]interface{}) (int64, int64) {
+func deriveTrafficCounters(metadataMaps []map[string]interface{}) (int64, int64, int64, int64) {
 	packetsIn := firstPositiveInt64FromMaps(metadataMaps,
 		"packets_in", "packets_incoming", "incoming_packets", "in_packets", "rx_packets",
 	)
 	packetsOut := firstPositiveInt64FromMaps(metadataMaps,
 		"packets_out", "packets_outgoing", "outgoing_packets", "out_packets", "tx_packets",
 	)
-	if packetsIn > 0 || packetsOut > 0 {
-		return packetsIn, packetsOut
-	}
-
 	bytesIn := firstPositiveInt64FromMaps(metadataMaps,
 		"bytes_received", "rx_bytes", "bytes_in", "incoming_bytes",
 	)
 	bytesOut := firstPositiveInt64FromMaps(metadataMaps,
 		"bytes_sent", "tx_bytes", "bytes_out", "outgoing_bytes",
 	)
-	if bytesIn > 0 {
+	if packetsIn == 0 && bytesIn > 0 {
 		packetsIn = estimatePacketsFromBytes(bytesIn)
 	}
-	if bytesOut > 0 {
+	if packetsOut == 0 && bytesOut > 0 {
 		packetsOut = estimatePacketsFromBytes(bytesOut)
 	}
-	return packetsIn, packetsOut
+	return packetsIn, packetsOut, bytesIn, bytesOut
 }
 
 func firstPositiveInt64FromMaps(metadataMaps []map[string]interface{}, keys ...string) int64 {
@@ -1152,7 +1307,10 @@ func collectMetadataMaps(metadata map[string]interface{}) []map[string]interface
 	}
 
 	maps := []map[string]interface{}{metadata}
-	for _, key := range []string{"metadata", "event", "data", "payload", "connection", "network"} {
+	for _, key := range []string{
+		"metadata", "event", "data", "payload", "connection", "network",
+		"tls", "ndpi", "verdict", "firewall", "policy", "security", "process",
+	} {
 		nestedRaw, ok := metadata[key]
 		if !ok {
 			continue
@@ -1317,6 +1475,59 @@ func normalizePID(pid int64) int64 {
 		return 0
 	}
 	return pid
+}
+
+func normalizeUIDGID(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func normalizeProtocolFromNumber(protocol int64) string {
+	switch protocol {
+	case 1:
+		return "icmp"
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	case 58:
+		return "icmpv6"
+	case 132:
+		return "sctp"
+	default:
+		return ""
+	}
+}
+
+func normalizeProtocol(raw string) string {
+	value := normalizeLabel(raw)
+	switch value {
+	case "tcp", "udp", "icmp", "icmpv6", "sctp":
+		return value
+	case "unknown":
+		return ""
+	}
+
+	if strings.HasPrefix(value, "unknown(") && strings.HasSuffix(value, ")") {
+		num := strings.TrimSuffix(strings.TrimPrefix(value, "unknown("), ")")
+		if parsed, err := strconv.ParseInt(num, 10, 64); err == nil {
+			return normalizeProtocolFromNumber(parsed)
+		}
+	}
+	if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return normalizeProtocolFromNumber(parsed)
+	}
+	return value
+}
+
+func normalizeLabel(raw string) string {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	if value == "" {
+		return ""
+	}
+	return value
 }
 
 func extractPortFromEndpoint(raw string) int64 {
