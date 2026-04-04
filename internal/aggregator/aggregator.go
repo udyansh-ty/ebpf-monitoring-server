@@ -20,6 +20,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -883,20 +885,24 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage,
 	// Raw eBPF per-event storage (ebpf_events) is intentionally bypassed.
 	eventType := event.Type()
 	if isMetaWindowOnlyEventType(eventType) {
-		if eventType == "connection" {
-			// ANCHOR: Log eBPF events being tracked for aggregation - March 21, 2026
-			metadata := event.Metadata()
-			srcIP := ""
-			dstIP := ""
-			if srcIPVal, ok := metadata["src_ip"].(string); ok {
-				srcIP = srcIPVal
+		metadata := event.Metadata()
+		if metadata != nil {
+			metadata["event_type"] = eventType
+			if _, ok := metadata["type"]; !ok {
+				metadata["type"] = eventType
 			}
-			if dstIPVal, ok := metadata["dst_ip"].(string); ok {
-				dstIP = dstIPVal
+			if _, ok := metadata["command"]; !ok {
+				if command := strings.TrimSpace(event.Command()); command != "" {
+					metadata["command"] = command
+				}
 			}
-			logger.Debugf("[INGEST] eBPF event type=%s src=%s dst=%s tracked in rollup", eventType, srcIP, dstIP)
-			a.trackMetaWindowRollup(event.Metadata())
+			if _, ok := metadata["pid"]; !ok {
+				if pid := event.PID(); pid > 0 {
+					metadata["pid"] = int64(pid)
+				}
+			}
 		}
+		a.trackMetaWindowRollup(metadata)
 		return nil
 	}
 
@@ -925,8 +931,8 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 
 	metadataMaps := collectMetadataMaps(metadata)
 	eventType := strings.ToLower(strings.TrimSpace(findFirstStringValue(metadataMaps, "type", "event_type")))
-	if eventType != "" && eventType != "connection" {
-		return
+	if eventType == "" {
+		eventType = "connection"
 	}
 
 	srcIP := extractNormalizedIP(metadataMaps,
@@ -987,7 +993,7 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	}
 	activeSeconds := deriveActiveSeconds(metadataMaps, firstSeenEpoch, lastSeenEpoch)
 	explicitActiveMetric := hasExplicitActiveMetric(metadataMaps)
-	packetsIn, packetsOut, bytesIn, bytesOut := deriveTrafficCounters(metadataMaps)
+	packetsIn, packetsOut, bytesIn, bytesOut := deriveTrafficCounters(metadataMaps, eventType)
 	if activeSeconds <= 0 && eventType == "connection" {
 		// Connection syscall events are point-in-time by default, so preserve a minimum
 		// active duration to avoid "always-zero" aggregates.
@@ -996,8 +1002,10 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	if packetsIn == 0 && packetsOut == 0 && bytesIn == 0 && bytesOut == 0 && eventType == "connection" {
 		// Minimum packet heuristic for connect events when packet counters are absent.
 		packetsOut = 1
+		bytesOut = estimateBytesFromPackets(packetsOut)
 		if returnCode, ok := getInt64FromMaps(metadataMaps, "return_code"); !ok || returnCode >= 0 {
 			packetsIn = 1
+			bytesIn = estimateBytesFromPackets(packetsIn)
 		}
 	}
 	protocol := normalizeProtocol(findFirstStringValue(metadataMaps, "protocol", "l4_protocol", "transport_protocol", "transport", "proto"))
@@ -1024,6 +1032,60 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	namespace := strings.TrimSpace(findFirstStringValue(metadataMaps, "namespace", "k8s_namespace", "pod_namespace"))
 	retransmissions := firstPositiveInt64FromMaps(metadataMaps, "retransmissions", "tcp_retransmissions", "retransmit_count")
 	drops := firstPositiveInt64FromMaps(metadataMaps, "drops", "drop_count", "packet_drops")
+	if eventType == "packet_drop" && drops == 0 {
+		drops = 1
+	}
+	if connectionState == "" {
+		if eventType == "packet_drop" {
+			connectionState = "dropped"
+		} else if returnCode, ok := getInt64FromMaps(metadataMaps, "return_code"); ok {
+			if returnCode < 0 {
+				connectionState = "failed"
+			} else {
+				connectionState = "connected"
+			}
+		}
+	}
+	if action == "" {
+		switch eventType {
+		case "packet_drop":
+			action = "drop"
+		case "connection":
+			if returnCode, ok := getInt64FromMaps(metadataMaps, "return_code"); ok && returnCode < 0 {
+				action = "deny"
+			} else {
+				action = "allow"
+			}
+		}
+	}
+	if decisionReason == "" {
+		if eventType == "packet_drop" && dropReason != "" {
+			decisionReason = dropReason
+		} else if returnCode, ok := getInt64FromMaps(metadataMaps, "return_code"); ok && returnCode < 0 {
+			decisionReason = fmt.Sprintf("connect_errno_%d", -returnCode)
+		}
+	}
+	if l7Protocol == "" {
+		l7Protocol = inferL7Protocol(dstPort, protocol, sni)
+	}
+	if pid > 0 && (uid == 0 || gid == 0 || command == "" || namespace == "") {
+		procUID, procGID, procCommand, procNamespace := readProcessContext(pid)
+		if uid == 0 && procUID > 0 {
+			uid = procUID
+		}
+		if gid == 0 && procGID > 0 {
+			gid = procGID
+		}
+		if command == "" && procCommand != "" {
+			command = procCommand
+		}
+		if namespace == "" && procNamespace != "" {
+			namespace = procNamespace
+		}
+	}
+	if namespace == "" {
+		namespace = "host"
+	}
 	if srcPort == 0 {
 		srcPort = normalizePort(extractPortFromEndpoint(findFirstStringValue(metadataMaps, "src_ip", "source_ip", "source_addr", "src_addr")))
 	}
@@ -1258,7 +1320,7 @@ func hasExplicitActiveMetric(metadataMaps []map[string]interface{}) bool {
 	return false
 }
 
-func deriveTrafficCounters(metadataMaps []map[string]interface{}) (int64, int64, int64, int64) {
+func deriveTrafficCounters(metadataMaps []map[string]interface{}, eventType string) (int64, int64, int64, int64) {
 	packetsIn := firstPositiveInt64FromMaps(metadataMaps,
 		"packets_in", "packets_incoming", "incoming_packets", "in_packets", "rx_packets",
 	)
@@ -1266,16 +1328,34 @@ func deriveTrafficCounters(metadataMaps []map[string]interface{}) (int64, int64,
 		"packets_out", "packets_outgoing", "outgoing_packets", "out_packets", "tx_packets",
 	)
 	bytesIn := firstPositiveInt64FromMaps(metadataMaps,
-		"bytes_received", "rx_bytes", "bytes_in", "incoming_bytes",
+		"bytes_received", "rx_bytes", "bytes_in", "incoming_bytes", "rx_queue_bytes",
 	)
 	bytesOut := firstPositiveInt64FromMaps(metadataMaps,
-		"bytes_sent", "tx_bytes", "bytes_out", "outgoing_bytes",
+		"bytes_sent", "tx_bytes", "bytes_out", "outgoing_bytes", "tx_queue_bytes",
 	)
+	packetSizeBytes := firstPositiveInt64FromMaps(metadataMaps,
+		"packet_size_bytes", "skb_length", "packet_length", "packet_bytes",
+	)
+	if eventType == "packet_drop" && packetSizeBytes > 0 && bytesOut == 0 {
+		bytesOut = packetSizeBytes
+	}
 	if packetsIn == 0 && bytesIn > 0 {
 		packetsIn = estimatePacketsFromBytes(bytesIn)
 	}
 	if packetsOut == 0 && bytesOut > 0 {
 		packetsOut = estimatePacketsFromBytes(bytesOut)
+	}
+	if bytesIn == 0 && packetsIn > 0 {
+		bytesIn = estimateBytesFromPackets(packetsIn)
+	}
+	if bytesOut == 0 && packetsOut > 0 {
+		bytesOut = estimateBytesFromPackets(packetsOut)
+	}
+	if eventType == "packet_drop" && packetsIn == 0 && packetsOut == 0 {
+		packetsOut = 1
+		if bytesOut == 0 && packetSizeBytes > 0 {
+			bytesOut = packetSizeBytes
+		}
 	}
 	return packetsIn, packetsOut, bytesIn, bytesOut
 }
@@ -1299,6 +1379,13 @@ func estimatePacketsFromBytes(bytes int64) int64 {
 		return 1
 	}
 	return packets
+}
+
+func estimateBytesFromPackets(packets int64) int64 {
+	if packets <= 0 {
+		return 0
+	}
+	return packets * 1500
 }
 
 func collectMetadataMaps(metadata map[string]interface{}) []map[string]interface{} {
@@ -1630,6 +1717,72 @@ func normalizeSNI(raw string) string {
 	}
 
 	return value
+}
+
+func inferL7Protocol(dstPort int64, protocol, sni string) string {
+	switch normalizeProtocol(protocol) {
+	case "icmp":
+		return "icmp"
+	case "udp":
+		if dstPort == 53 {
+			return "dns"
+		}
+	case "tcp":
+		switch dstPort {
+		case 53:
+			return "dns-tcp"
+		case 80, 8080, 8081:
+			return "http"
+		case 443, 8443:
+			if strings.TrimSpace(sni) != "" {
+				return "https"
+			}
+			return "tls"
+		case 22:
+			return "ssh"
+		case 5432:
+			return "postgres"
+		}
+	}
+	return ""
+}
+
+func readProcessContext(pid int64) (uid, gid int64, command, namespace string) {
+	if pid <= 0 {
+		return 0, 0, "", ""
+	}
+	base := filepath.Join("/proc", strconv.FormatInt(pid, 10))
+
+	if statusBytes, err := os.ReadFile(filepath.Join(base, "status")); err == nil {
+		for _, line := range strings.Split(string(statusBytes), "\n") {
+			if strings.HasPrefix(line, "Uid:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					if parsed, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						uid = normalizeUIDGID(parsed)
+					}
+				}
+			}
+			if strings.HasPrefix(line, "Gid:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					if parsed, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						gid = normalizeUIDGID(parsed)
+					}
+				}
+			}
+		}
+	}
+
+	if commBytes, err := os.ReadFile(filepath.Join(base, "comm")); err == nil {
+		command = strings.TrimSpace(string(commBytes))
+	}
+
+	if nsLink, err := os.Readlink(filepath.Join(base, "ns", "net")); err == nil {
+		namespace = strings.TrimSpace(nsLink)
+	}
+
+	return uid, gid, command, namespace
 }
 
 func getInt64Value(metadata map[string]interface{}, keys ...string) (int64, bool) {

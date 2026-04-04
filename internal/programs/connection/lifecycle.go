@@ -74,6 +74,7 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 		// fields[0] is the index (sl), fields[1] is local_address, fields[2] is rem_address
 		localAddr := fields[1]
 		remoteAddr := fields[2]
+		stateHex := fields[3]
 		queues := strings.SplitN(fields[4], ":", 2)
 		if len(queues) != 2 {
 			continue
@@ -124,6 +125,7 @@ func getConnectionStats(key ConnectionKey, connStartTime time.Time) *ConnectionS
 				activeSeconds = 1
 			}
 			stats.ActiveSeconds = activeSeconds
+			stats.State = parseTCPState(stateHex)
 
 			logger.Debugf("[Lifecycle] Found connection %s:%d -> %s:%d: tx=%d rx=%d active=%ds",
 				localIP, localPort, remoteIP, remotePort, txVal, rxVal, stats.ActiveSeconds)
@@ -197,7 +199,12 @@ func enrichEventWithLifecycleData(
 	metadata["packets_outgoing"] = metadata["packets_out"]
 	metadata["rx_queue_bytes"] = stats.RxQueue
 	metadata["tx_queue_bytes"] = stats.TxQueue
+	metadata["bytes_received"] = int64(stats.RxQueue)
+	metadata["bytes_sent"] = int64(stats.TxQueue)
 	metadata["active_seconds"] = stats.ActiveSeconds
+	if stats.State != "" {
+		metadata["connection_state"] = strings.ToLower(stats.State)
+	}
 
 	logger.Debugf("[Lifecycle] Added stats to event: in=%d out=%d active=%ds",
 		metadata["packets_in"], metadata["packets_out"], stats.ActiveSeconds)
@@ -213,4 +220,37 @@ func estimatePacketCountFromBytes(queueBytes uint64) int64 {
 		return 1
 	}
 	return packetEstimate
+}
+
+func parseTCPState(stateHex string) string {
+	stateCode, err := strconv.ParseUint(stateHex, 16, 8)
+	if err != nil {
+		return ""
+	}
+	switch stateCode {
+	case 0x01:
+		return "ESTABLISHED"
+	case 0x02:
+		return "SYN_SENT"
+	case 0x03:
+		return "SYN_RECV"
+	case 0x04:
+		return "FIN_WAIT1"
+	case 0x05:
+		return "FIN_WAIT2"
+	case 0x06:
+		return "TIME_WAIT"
+	case 0x07:
+		return "CLOSE"
+	case 0x08:
+		return "CLOSE_WAIT"
+	case 0x09:
+		return "LAST_ACK"
+	case 0x0A:
+		return "LISTEN"
+	case 0x0B:
+		return "CLOSING"
+	default:
+		return ""
+	}
 }
