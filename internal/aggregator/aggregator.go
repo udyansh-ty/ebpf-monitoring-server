@@ -171,10 +171,6 @@ type metaRollupAggregate struct {
 	GID             int64
 	ConnectionState string
 	Action          string
-	RuleID          string
-	PolicyID        string
-	DropReason      string
-	DecisionReason  string
 	L7Protocol      string
 	Command         string
 	Namespace       string
@@ -717,10 +713,6 @@ func (a *Aggregator) drainMetaRollups() []storage.EBPFMetaWindowRow {
 			GID:             entry.GID,
 			ConnectionState: entry.ConnectionState,
 			Action:          entry.Action,
-			RuleID:          entry.RuleID,
-			PolicyID:        entry.PolicyID,
-			DropReason:      entry.DropReason,
-			DecisionReason:  entry.DecisionReason,
 			L7Protocol:      entry.L7Protocol,
 			Command:         entry.Command,
 			Namespace:       entry.Namespace,
@@ -780,18 +772,6 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 			if row.Action != "" {
 				existing.Action = row.Action
 			}
-			if row.RuleID != "" {
-				existing.RuleID = row.RuleID
-			}
-			if row.PolicyID != "" {
-				existing.PolicyID = row.PolicyID
-			}
-			if row.DropReason != "" {
-				existing.DropReason = row.DropReason
-			}
-			if row.DecisionReason != "" {
-				existing.DecisionReason = row.DecisionReason
-			}
 			if row.L7Protocol != "" {
 				existing.L7Protocol = row.L7Protocol
 			}
@@ -826,10 +806,6 @@ func (a *Aggregator) mergeMetaRollupRows(rows []storage.EBPFMetaWindowRow) {
 			GID:             row.GID,
 			ConnectionState: row.ConnectionState,
 			Action:          row.Action,
-			RuleID:          row.RuleID,
-			PolicyID:        row.PolicyID,
-			DropReason:      row.DropReason,
-			DecisionReason:  row.DecisionReason,
 			L7Protocol:      row.L7Protocol,
 			Command:         row.Command,
 			Namespace:       row.Namespace,
@@ -1023,10 +999,6 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 	gid := normalizeUIDGID(firstPositiveInt64FromMaps(metadataMaps, "gid", "group_id", "egid"))
 	connectionState := normalizeLabel(findFirstStringValue(metadataMaps, "connection_state", "conn_state", "state", "tcp_state"))
 	action := normalizeLabel(findFirstStringValue(metadataMaps, "action", "verdict_action", "firewall_action", "decision_action"))
-	ruleID := strings.TrimSpace(findFirstStringValue(metadataMaps, "rule_id", "verdict_rule_id", "firewall_rule_id"))
-	policyID := strings.TrimSpace(findFirstStringValue(metadataMaps, "policy_id", "security_policy_id"))
-	dropReason := normalizeLabel(findFirstStringValue(metadataMaps, "drop_reason", "drop_reason_code", "reason"))
-	decisionReason := normalizeLabel(findFirstStringValue(metadataMaps, "decision_reason", "verdict_reason", "policy_reason"))
 	l7Protocol := normalizeLabel(findFirstStringValue(metadataMaps, "l7_protocol", "application_protocol", "ndpi_protocol"))
 	command := strings.TrimSpace(findFirstStringValue(metadataMaps, "command", "process_name", "comm"))
 	namespace := strings.TrimSpace(findFirstStringValue(metadataMaps, "namespace", "k8s_namespace", "pod_namespace"))
@@ -1056,13 +1028,6 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 			} else {
 				action = "allow"
 			}
-		}
-	}
-	if decisionReason == "" {
-		if eventType == "packet_drop" && dropReason != "" {
-			decisionReason = dropReason
-		} else if returnCode, ok := getInt64FromMaps(metadataMaps, "return_code"); ok && returnCode < 0 {
-			decisionReason = fmt.Sprintf("connect_errno_%d", -returnCode)
 		}
 	}
 	if l7Protocol == "" {
@@ -1196,18 +1161,6 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		if action != "" {
 			entry.Action = action
 		}
-		if ruleID != "" {
-			entry.RuleID = ruleID
-		}
-		if policyID != "" {
-			entry.PolicyID = policyID
-		}
-		if dropReason != "" {
-			entry.DropReason = dropReason
-		}
-		if decisionReason != "" {
-			entry.DecisionReason = decisionReason
-		}
 		if l7Protocol != "" {
 			entry.L7Protocol = l7Protocol
 		}
@@ -1242,10 +1195,6 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		GID:             gid,
 		ConnectionState: connectionState,
 		Action:          action,
-		RuleID:          ruleID,
-		PolicyID:        policyID,
-		DropReason:      dropReason,
-		DecisionReason:  decisionReason,
 		L7Protocol:      l7Protocol,
 		Command:         command,
 		Namespace:       namespace,

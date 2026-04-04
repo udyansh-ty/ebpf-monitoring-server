@@ -28,10 +28,6 @@ CREATE TABLE IF NOT EXISTS ebpf_meta_window (
   gid               BIGINT NOT NULL DEFAULT 0,
   connection_state  TEXT   NOT NULL DEFAULT '',
   action            TEXT   NOT NULL DEFAULT '',
-  rule_id           TEXT   NOT NULL DEFAULT '',
-  policy_id         TEXT   NOT NULL DEFAULT '',
-  drop_reason       TEXT   NOT NULL DEFAULT '',
-  decision_reason   TEXT   NOT NULL DEFAULT '',
   l7_protocol       TEXT   NOT NULL DEFAULT '',
   command           TEXT   NOT NULL DEFAULT '',
   namespace         TEXT   NOT NULL DEFAULT '',
@@ -121,14 +117,6 @@ BEGIN
   ALTER TABLE ebpf_meta_window
     ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT '';
   ALTER TABLE ebpf_meta_window
-    ADD COLUMN IF NOT EXISTS rule_id TEXT NOT NULL DEFAULT '';
-  ALTER TABLE ebpf_meta_window
-    ADD COLUMN IF NOT EXISTS policy_id TEXT NOT NULL DEFAULT '';
-  ALTER TABLE ebpf_meta_window
-    ADD COLUMN IF NOT EXISTS drop_reason TEXT NOT NULL DEFAULT '';
-  ALTER TABLE ebpf_meta_window
-    ADD COLUMN IF NOT EXISTS decision_reason TEXT NOT NULL DEFAULT '';
-  ALTER TABLE ebpf_meta_window
     ADD COLUMN IF NOT EXISTS l7_protocol TEXT NOT NULL DEFAULT '';
   ALTER TABLE ebpf_meta_window
     ADD COLUMN IF NOT EXISTS command TEXT NOT NULL DEFAULT '';
@@ -142,6 +130,14 @@ BEGIN
     ADD COLUMN IF NOT EXISTS retransmissions BIGINT NOT NULL DEFAULT 0;
   ALTER TABLE ebpf_meta_window
     ADD COLUMN IF NOT EXISTS drops BIGINT NOT NULL DEFAULT 0;
+  ALTER TABLE ebpf_meta_window
+    DROP COLUMN IF EXISTS rule_id;
+  ALTER TABLE ebpf_meta_window
+    DROP COLUMN IF EXISTS policy_id;
+  ALTER TABLE ebpf_meta_window
+    DROP COLUMN IF EXISTS drop_reason;
+  ALTER TABLE ebpf_meta_window
+    DROP COLUMN IF EXISTS decision_reason;
 
   SELECT EXISTS (
     SELECT 1
@@ -167,10 +163,6 @@ BEGIN
       gid               BIGINT NOT NULL DEFAULT 0,
       connection_state  TEXT   NOT NULL DEFAULT '',
       action            TEXT   NOT NULL DEFAULT '',
-      rule_id           TEXT   NOT NULL DEFAULT '',
-      policy_id         TEXT   NOT NULL DEFAULT '',
-      drop_reason       TEXT   NOT NULL DEFAULT '',
-      decision_reason   TEXT   NOT NULL DEFAULT '',
       l7_protocol       TEXT   NOT NULL DEFAULT '',
       command           TEXT   NOT NULL DEFAULT '',
       namespace         TEXT   NOT NULL DEFAULT '',
@@ -189,8 +181,7 @@ BEGIN
 
     INSERT INTO ebpf_meta_window_rebuild (
       bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, protocol,
-      sni, pid, uid, gid, connection_state, action, rule_id, policy_id,
-      drop_reason, decision_reason, l7_protocol, command, namespace,
+      sni, pid, uid, gid, connection_state, action, l7_protocol, command, namespace,
       active_seconds, packets_in, packets_out, bytes_in, bytes_out, retransmissions, drops, session_count,
       first_seen_epoch, last_seen_epoch
     )
@@ -208,10 +199,6 @@ BEGIN
       COALESCE(MAX(gid), 0) AS gid,
       COALESCE(MAX(connection_state), '') AS connection_state,
       COALESCE(MAX(action), '') AS action,
-      COALESCE(MAX(rule_id), '') AS rule_id,
-      COALESCE(MAX(policy_id), '') AS policy_id,
-      COALESCE(MAX(drop_reason), '') AS drop_reason,
-      COALESCE(MAX(decision_reason), '') AS decision_reason,
       COALESCE(MAX(l7_protocol), '') AS l7_protocol,
       COALESCE(MAX(command), '') AS command,
       COALESCE(MAX(namespace), '') AS namespace,

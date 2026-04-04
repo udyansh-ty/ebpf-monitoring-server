@@ -205,6 +205,9 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 		"raw_socktype": sockType,
 	}
 
+	// Capture process identity at source while PID is still hot in /proc.
+	command = enrichProcessIdentityMetadata(pid, command, metadata)
+
 	// Resolve source port with improved method
 	sourcePort := resolveSourcePort(pid, family, destinationIP, destPort, protocol)
 	if sourcePort != 0 {
@@ -239,7 +242,7 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 	// Enrich with connection lifecycle data (packets, active_seconds)
 	// Use current time since the event was just captured
 	// Note: sourcePort may be 0 if resolution failed, in which case we can't match in /proc/net/tcp
-	if sourcePort != 0 {  // Only enrich if we have valid source port
+	if sourcePort != 0 { // Only enrich if we have valid source port
 		enrichEventWithLifecycleData(metadata, sourceIP, sourcePort, destinationIP, destPort, family, time.Now())
 	}
 
@@ -255,6 +258,48 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 	}
 
 	return event, nil
+}
+
+func enrichProcessIdentityMetadata(pid uint32, command string, metadata map[string]interface{}) string {
+	if pid == 0 || metadata == nil {
+		return command
+	}
+
+	procPath := filepath.Join("/proc", strconv.FormatUint(uint64(pid), 10))
+
+	if statusBytes, err := os.ReadFile(filepath.Join(procPath, "status")); err == nil {
+		for _, line := range strings.Split(string(statusBytes), "\n") {
+			if strings.HasPrefix(line, "Uid:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					if uid, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						metadata["uid"] = uid
+					}
+				}
+			}
+			if strings.HasPrefix(line, "Gid:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					if gid, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						metadata["gid"] = gid
+					}
+				}
+			}
+		}
+	}
+
+	if commBytes, err := os.ReadFile(filepath.Join(procPath, "comm")); err == nil {
+		procCommand := strings.TrimSpace(string(commBytes))
+		if procCommand != "" {
+			metadata["process_name"] = procCommand
+			metadata["command"] = procCommand
+			if strings.TrimSpace(command) == "" {
+				command = procCommand
+			}
+		}
+	}
+
+	return command
 }
 
 // extractNullTerminatedString extracts a null-terminated string from a byte slice.
@@ -885,7 +930,7 @@ func resolveInterfaceIPv4(destIP string) string {
 	logger.Debugf("[Route Debug] Searching for IP: %s (little-endian uint32: 0x%08X)", destIP, destIPUint)
 
 	var bestMatch string
-	var bestMaskLen int = -1  // Initialize to -1 so default route (0 bits) matches
+	var bestMaskLen int = -1 // Initialize to -1 so default route (0 bits) matches
 	var routeCount int
 
 	for scanner.Scan() {
@@ -975,7 +1020,7 @@ func resolveInterfaceIPv6(destIP string) string {
 
 	scanner := bufio.NewScanner(file)
 	var bestMatch string
-	var bestPrefixLen int = -1  // Initialize to -1 so default route (0 prefix) matches
+	var bestPrefixLen int = -1 // Initialize to -1 so default route (0 prefix) matches
 
 	for scanner.Scan() {
 		line := scanner.Text()

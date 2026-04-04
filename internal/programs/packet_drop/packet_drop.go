@@ -5,6 +5,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/internal/events"
@@ -108,6 +112,7 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 		"skb_length":        skbLen,
 		"packet_size_bytes": skbLen,
 	}
+	command = enrichProcessIdentityMetadata(pid, command, metadata)
 
 	event := events.NewBaseEvent("packet_drop", pid, command, timestamp, metadata)
 
@@ -144,4 +149,46 @@ func formatDropReason(reason uint32) string {
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", reason)
 	}
+}
+
+func enrichProcessIdentityMetadata(pid uint32, command string, metadata map[string]interface{}) string {
+	if pid == 0 || metadata == nil {
+		return command
+	}
+
+	procPath := filepath.Join("/proc", strconv.FormatUint(uint64(pid), 10))
+
+	if statusBytes, err := os.ReadFile(filepath.Join(procPath, "status")); err == nil {
+		for _, line := range strings.Split(string(statusBytes), "\n") {
+			if strings.HasPrefix(line, "Uid:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					if uid, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						metadata["uid"] = uid
+					}
+				}
+			}
+			if strings.HasPrefix(line, "Gid:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					if gid, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						metadata["gid"] = gid
+					}
+				}
+			}
+		}
+	}
+
+	if commBytes, err := os.ReadFile(filepath.Join(procPath, "comm")); err == nil {
+		procCommand := strings.TrimSpace(string(commBytes))
+		if procCommand != "" {
+			metadata["process_name"] = procCommand
+			metadata["command"] = procCommand
+			if strings.TrimSpace(command) == "" {
+				command = procCommand
+			}
+		}
+	}
+
+	return command
 }

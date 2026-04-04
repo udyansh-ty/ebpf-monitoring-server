@@ -47,10 +47,6 @@ type EBPFMetaWindowRow struct {
 	GID             int64
 	ConnectionState string
 	Action          string
-	RuleID          string
-	PolicyID        string
-	DropReason      string
-	DecisionReason  string
 	L7Protocol      string
 	Command         string
 	Namespace       string
@@ -82,16 +78,14 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 	sql := `
 		INSERT INTO ebpf_meta_window (
 			bucket_epoch, src_ip, dst_ip, src_port, dst_port, interface_name, protocol,
-			sni, pid, uid, gid, connection_state, action, rule_id, policy_id,
-			drop_reason, decision_reason, l7_protocol, command, namespace,
+			sni, pid, uid, gid, connection_state, action, l7_protocol, command, namespace,
 			active_seconds, packets_in, packets_out, bytes_in, bytes_out, retransmissions, drops, session_count,
 			first_seen_epoch, last_seen_epoch
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7,
-			$8, $9, $10, $11, $12, $13, $14, $15,
-			$16, $17, $18, $19, $20,
-			$21, $22, $23, $24, $25, $26, $27, $28,
-			$29, $30
+			$8, $9, $10, $11, $12, $13, $14, $15, $16,
+			$17, $18, $19, $20, $21, $22, $23, $24,
+			$25, $26
 		)
 		ON CONFLICT (src_ip, dst_ip, src_port, dst_port, interface_name, protocol) DO UPDATE SET
 			bucket_epoch = GREATEST(ebpf_meta_window.bucket_epoch, EXCLUDED.bucket_epoch),
@@ -118,22 +112,6 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 			action = CASE
 				WHEN EXCLUDED.action <> '' THEN EXCLUDED.action
 				ELSE ebpf_meta_window.action
-			END,
-			rule_id = CASE
-				WHEN EXCLUDED.rule_id <> '' THEN EXCLUDED.rule_id
-				ELSE ebpf_meta_window.rule_id
-			END,
-			policy_id = CASE
-				WHEN EXCLUDED.policy_id <> '' THEN EXCLUDED.policy_id
-				ELSE ebpf_meta_window.policy_id
-			END,
-			drop_reason = CASE
-				WHEN EXCLUDED.drop_reason <> '' THEN EXCLUDED.drop_reason
-				ELSE ebpf_meta_window.drop_reason
-			END,
-			decision_reason = CASE
-				WHEN EXCLUDED.decision_reason <> '' THEN EXCLUDED.decision_reason
-				ELSE ebpf_meta_window.decision_reason
 			END,
 			l7_protocol = CASE
 				WHEN EXCLUDED.l7_protocol <> '' THEN EXCLUDED.l7_protocol
@@ -171,8 +149,7 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 	for _, row := range rows {
 		batch.Queue(sql,
 			row.BucketEpoch, row.SrcIP, row.DstIP, row.SrcPort, row.DstPort, row.InterfaceName, row.Protocol,
-			row.SNI, row.PID, row.UID, row.GID, row.ConnectionState, row.Action, row.RuleID, row.PolicyID,
-			row.DropReason, row.DecisionReason, row.L7Protocol, row.Command, row.Namespace,
+			row.SNI, row.PID, row.UID, row.GID, row.ConnectionState, row.Action, row.L7Protocol, row.Command, row.Namespace,
 			row.ActiveSeconds, row.PacketsIn, row.PacketsOut, row.BytesIn, row.BytesOut, row.Retransmissions, row.Drops, row.SessionCount,
 			row.FirstSeenEpoch, row.LastSeenEpoch,
 		)
