@@ -1345,7 +1345,7 @@ func collectMetadataMaps(metadata map[string]interface{}) []map[string]interface
 	maps := []map[string]interface{}{metadata}
 	for _, key := range []string{
 		"metadata", "event", "data", "payload", "connection", "network",
-		"tls", "ndpi", "verdict", "firewall", "policy", "security", "process",
+		"tls", "dns", "ndpi", "verdict", "firewall", "policy", "security", "process",
 	} {
 		nestedRaw, ok := metadata[key]
 		if !ok {
@@ -1611,7 +1611,10 @@ func extractSNI(metadataMaps []map[string]interface{}) string {
 			continue
 		}
 
-		for _, key := range []string{"sni", "server_name", "tls_sni", "hostname", "host", "domain"} {
+		for _, key := range []string{
+			"sni", "server_name", "tls_sni", "hostname", "host", "domain",
+			"qname", "dns_qname", "query_name", "dns_query", "question_name", "query",
+		} {
 			if value := normalizeSNI(getStringValue(metadata, key)); value != "" {
 				return value
 			}
