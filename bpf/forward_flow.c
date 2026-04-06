@@ -119,7 +119,7 @@ static __always_inline int emit_flow_event(struct __sk_buff *skb, __u8 hook) {
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->ts = bpf_ktime_get_ns();
-	e->pid = bpf_get_current_pid_tgid() >> 32;
+	e->pid = 0;
 	e->packet_len = skb->len;
 	e->hook = hook;
 	e->ifindex = (hook == 1) ? skb->ingress_ifindex : skb->ifindex;
