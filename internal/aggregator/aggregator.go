@@ -919,6 +919,21 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		"dst_ip", "dest_ip", "destination_ip", "server_ip", "remote_ip",
 		"destination", "remote_addr", "dst_addr", "daddr",
 	)
+	if eventType == "packet_drop" {
+		// Packet drop probes can execute in kernel context and may not expose full tuple fields.
+		// Keep drops visible in metadata rollups by falling back to ingest source.
+		if srcIP == "" {
+			srcIP = extractNormalizedIP(metadataMaps,
+				"ingest_remote_ip", "agent_ip", "machine_ip", "local_ip",
+			)
+		}
+		if srcIP == "" {
+			srcIP = "0.0.0.0"
+		}
+		if dstIP == "" {
+			dstIP = srcIP
+		}
+	}
 	if srcIP == "" {
 		return
 	}

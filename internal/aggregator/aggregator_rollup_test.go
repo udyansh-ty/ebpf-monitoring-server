@@ -383,6 +383,41 @@ func TestTrackMetaWindowRollupUsesIngestRemoteIPFallback(t *testing.T) {
 	}
 }
 
+func TestTrackMetaWindowRollupUsesFallbackIPsForPacketDrop(t *testing.T) {
+	agg, err := New(&Config{})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"event_type":       "packet_drop",
+		"ingest_remote_ip": "10.10.10.10",
+		"timestamp":        float64(1773919458000000000),
+		"drop_reason":      "NETFILTER_DROP",
+	})
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected one rollup for packet_drop fallback, got %d", len(agg.metaRollups))
+	}
+
+	key := metaRollupKey{
+		SrcIP: "10.10.10.10",
+		DstIP: "10.10.10.10",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for key %+v", key)
+	}
+	if entry.Drops != 1 {
+		t.Fatalf("expected drops=1, got %d", entry.Drops)
+	}
+	if entry.Action != "drop" {
+		t.Fatalf("expected action=drop, got %q", entry.Action)
+	}
+}
+
 func TestTrackMetaWindowRollupMergesAcrossSNI(t *testing.T) {
 	agg, err := New(&Config{})
 	if err != nil {
