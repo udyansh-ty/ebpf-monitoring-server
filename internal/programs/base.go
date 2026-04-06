@@ -430,3 +430,27 @@ func (p *BaseProgram) AttachToTracepoint(progName, group, name string) error {
 
 	return nil
 }
+
+// AttachToKprobe attaches a program to a kernel symbol via kprobe.
+func (p *BaseProgram) AttachToKprobe(progName, symbol string) error {
+	collection := p.GetCollection()
+	if collection == nil {
+		return fmt.Errorf("program not loaded")
+	}
+
+	prog := collection.Programs[progName]
+	if prog == nil {
+		return fmt.Errorf("program %s not found in collection", progName)
+	}
+
+	logger.Debugf("Attaching program %s to kprobe %s", progName, symbol)
+
+	l, err := link.Kprobe(symbol, prog, nil)
+	if err != nil {
+		return fmt.Errorf("failed to attach to kprobe %s: %w", symbol, err)
+	}
+
+	p.AddLink(l)
+	logger.Debugf("Successfully attached program %s to kprobe %s", progName, symbol)
+	return nil
+}

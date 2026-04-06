@@ -893,7 +893,7 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage,
 
 func isMetaWindowOnlyEventType(eventType string) bool {
 	switch eventType {
-	case "connection", "packet_drop", "packet", "process", "process_exec", "file_operation":
+	case "connection", "packet_drop", "packet", "process", "process_exec", "file_operation", "forward_flow":
 		return true
 	default:
 		return false
