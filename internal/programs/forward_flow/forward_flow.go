@@ -8,6 +8,8 @@ import (
 	"net"
 	"strings"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/internal/events"
 	"github.com/srodi/ebpf-server/internal/programs"
@@ -16,14 +18,14 @@ import (
 
 const (
 	ProgramName        = "forward_flow"
-	ProgramDescription = "Monitors forwarded traffic for NAT/masquerade visibility"
+	ProgramDescription = "Monitors forwarded traffic via TCX ingress/egress for NAT/masquerade visibility"
 	ObjectPath         = "bpf/forward_flow.o"
 
 	EventsMapName = "events"
 )
 
 const (
-	hookForward = 1
+	hookIngress = 1
 	hookEgress  = 2
 )
 
@@ -45,23 +47,61 @@ func (p *Program) Attach(ctx context.Context) error {
 	if !p.IsLoaded() {
 		return fmt.Errorf("program not loaded")
 	}
-
 	_ = ctx
 
-	attachments := []struct {
-		progName string
-		symbol   string
-	}{
-		{progName: "kprobe_ip_forward", symbol: "ip_forward"},
-		{progName: "kprobe_ip6_forward", symbol: "ip6_forward"},
-		{progName: "kprobe_ip_finish_output2", symbol: "ip_finish_output2"},
-		{progName: "kprobe_ip6_finish_output2", symbol: "ip6_finish_output2"},
+	collection := p.GetCollection()
+	if collection == nil {
+		return fmt.Errorf("forward_flow collection not loaded")
 	}
 
-	for _, a := range attachments {
-		if err := p.AttachToKprobe(a.progName, a.symbol); err != nil {
-			return err
+	ingressProg := collection.Programs["tc_forward_ingress"]
+	if ingressProg == nil {
+		return fmt.Errorf("program tc_forward_ingress not found in collection")
+	}
+	egressProg := collection.Programs["tc_forward_egress"]
+	if egressProg == nil {
+		return fmt.Errorf("program tc_forward_egress not found in collection")
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("failed to list interfaces: %w", err)
+	}
+
+	attachedCount := 0
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
 		}
+
+		inLink, err := link.AttachTCX(link.TCXOptions{
+			Interface: iface.Index,
+			Program:   ingressProg,
+			Attach:    ebpf.AttachTCXIngress,
+		})
+		if err != nil {
+			logger.Warnf("forward_flow: failed ingress attach on %s(%d): %v", iface.Name, iface.Index, err)
+		} else {
+			p.AddLink(inLink)
+			attachedCount++
+		}
+
+		egLink, err := link.AttachTCX(link.TCXOptions{
+			Interface: iface.Index,
+			Program:   egressProg,
+			Attach:    ebpf.AttachTCXEgress,
+		})
+		if err != nil {
+			logger.Warnf("forward_flow: failed egress attach on %s(%d): %v", iface.Name, iface.Index, err)
+		} else {
+			p.AddLink(egLink)
+			attachedCount++
+		}
+	}
+
+	if attachedCount == 0 {
+		logger.Warnf("forward_flow: no tcx attachments succeeded, continuing without forwarding capture")
+		return nil
 	}
 
 	parser := NewEventParser()
@@ -124,8 +164,16 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 	proto := protocolToString(protocol)
 	hookName := hookToString(hook)
 	direction := "egress"
-	if hook == hookForward {
-		direction = "forward"
+	packetsIn := int64(0)
+	packetsOut := int64(1)
+	bytesIn := int64(0)
+	bytesOut := int64(packetLen)
+	if hook == hookIngress {
+		direction = "ingress"
+		packetsIn = 1
+		packetsOut = 0
+		bytesIn = int64(packetLen)
+		bytesOut = 0
 	}
 
 	metadata := map[string]interface{}{
@@ -146,8 +194,10 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 		"hook":               hookName,
 		"direction":          direction,
 		"packet_size_bytes":  int64(packetLen),
-		"bytes_out":          int64(packetLen),
-		"packets_out":        int64(1),
+		"bytes_in":           bytesIn,
+		"bytes_out":          bytesOut,
+		"packets_in":         packetsIn,
+		"packets_out":        packetsOut,
 		"connection_state":   "forwarded",
 		"action":             "allow",
 		"address_family":     int64(family),
@@ -161,10 +211,10 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 
 func hookToString(hook uint8) string {
 	switch hook {
-	case hookForward:
-		return "forward"
+	case hookIngress:
+		return "ingress"
 	case hookEgress:
-		return "postrouting_egress"
+		return "egress"
 	default:
 		return "unknown"
 	}
