@@ -9,6 +9,7 @@ import (
 	"github.com/srodi/ebpf-server/internal/core"
 	"github.com/srodi/ebpf-server/internal/programs"
 	"github.com/srodi/ebpf-server/internal/programs/connection"
+	"github.com/srodi/ebpf-server/internal/programs/forward_flow"
 	"github.com/srodi/ebpf-server/internal/programs/packet_drop"
 	"github.com/srodi/ebpf-server/internal/storage"
 	"github.com/srodi/ebpf-server/pkg/logger"
@@ -54,6 +55,13 @@ func (s *System) Initialize() error {
 		return fmt.Errorf("failed to register packet drop program: %w", err)
 	}
 	logger.Debugf("✅ Registered packet drop monitoring program")
+
+	// Register forwarding flow monitoring program
+	forwardProgram := forward_flow.NewProgram()
+	if err := s.manager.RegisterProgram(forwardProgram); err != nil {
+		return fmt.Errorf("failed to register forward flow program: %w", err)
+	}
+	logger.Debugf("✅ Registered forward flow monitoring program")
 
 	logger.Info("🚀 eBPF monitoring system initialized successfully")
 	return nil

@@ -24,11 +24,15 @@ const (
 
 	// eBPF program and map names
 	TracepointProgram = "trace_kfree_skb"
+	KprobeProgram     = "trace_tcp_drop"
 	EventsMapName     = "drop_events"
 
 	// Tracepoint configuration
 	TracepointGroup = "skb"
 	TracepointName  = "kfree_skb"
+
+	// Optional kprobe for TCP-specific drop path.
+	KprobeSymbol = "tcp_drop"
 )
 
 // Program implements the packet drop monitoring eBPF program.
@@ -55,6 +59,10 @@ func (p *Program) Attach(ctx context.Context) error {
 	// Attach to kfree_skb tracepoint
 	if err := p.AttachToTracepoint(TracepointProgram, TracepointGroup, TracepointName); err != nil {
 		return fmt.Errorf("failed to attach to tracepoint: %w", err)
+	}
+	// Optional attach: kernel versions differ on symbol availability.
+	if err := p.AttachToKprobe(KprobeProgram, KprobeSymbol); err != nil {
+		logger.Warnf("packet_drop: optional kprobe attach %s failed: %v", KprobeSymbol, err)
 	}
 
 	// Start ring buffer reader
@@ -112,6 +120,7 @@ func (p *EventParser) Parse(data []byte) (core.Event, error) {
 		"skb_length":        skbLen,
 		"packet_size_bytes": skbLen,
 	}
+
 	command = enrichProcessIdentityMetadata(pid, command, metadata)
 
 	event := events.NewBaseEvent("packet_drop", pid, command, timestamp, metadata)

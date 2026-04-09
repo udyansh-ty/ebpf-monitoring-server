@@ -893,7 +893,7 @@ func (a *Aggregator) ingestEvent(ctx context.Context, eventData json.RawMessage,
 
 func isMetaWindowOnlyEventType(eventType string) bool {
 	switch eventType {
-	case "connection", "packet_drop", "packet", "process", "process_exec", "file_operation":
+	case "connection", "packet_drop", "packet", "process", "process_exec", "file_operation", "forward_flow":
 		return true
 	default:
 		return false
@@ -919,6 +919,21 @@ func (a *Aggregator) trackMetaWindowRollup(metadata map[string]interface{}) {
 		"dst_ip", "dest_ip", "destination_ip", "server_ip", "remote_ip",
 		"destination", "remote_addr", "dst_addr", "daddr",
 	)
+	if eventType == "packet_drop" {
+		// Packet drop probes can execute in kernel context and may not expose full tuple fields.
+		// Keep drops visible in metadata rollups by falling back to ingest source.
+		if srcIP == "" {
+			srcIP = extractNormalizedIP(metadataMaps,
+				"ingest_remote_ip", "agent_ip", "machine_ip", "local_ip",
+			)
+		}
+		if srcIP == "" {
+			srcIP = "0.0.0.0"
+		}
+		if dstIP == "" {
+			dstIP = srcIP
+		}
+	}
 	if srcIP == "" {
 		return
 	}
@@ -1345,7 +1360,7 @@ func collectMetadataMaps(metadata map[string]interface{}) []map[string]interface
 	maps := []map[string]interface{}{metadata}
 	for _, key := range []string{
 		"metadata", "event", "data", "payload", "connection", "network",
-		"tls", "ndpi", "verdict", "firewall", "policy", "security", "process",
+		"tls", "dns", "ndpi", "verdict", "firewall", "policy", "security", "process",
 	} {
 		nestedRaw, ok := metadata[key]
 		if !ok {
@@ -1611,7 +1626,10 @@ func extractSNI(metadataMaps []map[string]interface{}) string {
 			continue
 		}
 
-		for _, key := range []string{"sni", "server_name", "tls_sni", "hostname", "host", "domain"} {
+		for _, key := range []string{
+			"sni", "server_name", "tls_sni", "hostname", "host", "domain",
+			"qname", "dns_qname", "query_name", "dns_query", "question_name", "query",
+		} {
 			if value := normalizeSNI(getStringValue(metadata, key)); value != "" {
 				return value
 			}

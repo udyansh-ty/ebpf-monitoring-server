@@ -383,6 +383,41 @@ func TestTrackMetaWindowRollupUsesIngestRemoteIPFallback(t *testing.T) {
 	}
 }
 
+func TestTrackMetaWindowRollupUsesFallbackIPsForPacketDrop(t *testing.T) {
+	agg, err := New(&Config{})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"event_type":       "packet_drop",
+		"ingest_remote_ip": "10.10.10.10",
+		"timestamp":        float64(1773919458000000000),
+		"drop_reason":      "NETFILTER_DROP",
+	})
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected one rollup for packet_drop fallback, got %d", len(agg.metaRollups))
+	}
+
+	key := metaRollupKey{
+		SrcIP: "10.10.10.10",
+		DstIP: "10.10.10.10",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for key %+v", key)
+	}
+	if entry.Drops != 1 {
+		t.Fatalf("expected drops=1, got %d", entry.Drops)
+	}
+	if entry.Action != "drop" {
+		t.Fatalf("expected action=drop, got %q", entry.Action)
+	}
+}
+
 func TestTrackMetaWindowRollupMergesAcrossSNI(t *testing.T) {
 	agg, err := New(&Config{})
 	if err != nil {
@@ -430,6 +465,91 @@ func TestTrackMetaWindowRollupMergesAcrossSNI(t *testing.T) {
 	}
 	if entry.SNI != "www.youtube.com" {
 		t.Fatalf("expected latest non-empty sni to be tracked, got %q", entry.SNI)
+	}
+}
+
+func TestTrackMetaWindowRollupUsesQnameWhenSNIAbsent(t *testing.T) {
+	agg, err := New(&Config{})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"type":             "connection",
+		"src_ip":           "192.168.1.25",
+		"dst_ip":           "8.8.8.8",
+		"src_port":         float64(53000),
+		"dst_port":         float64(53),
+		"protocol":         "udp",
+		"qname":            "WWW.GOOGLE.COM.",
+		"session_start_ns": float64(1773919447000000000),
+		"session_end_ns":   float64(1773919449000000000),
+		"packets_incoming": float64(1),
+		"packets_outgoing": float64(1),
+	})
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected one rollup, got %d", len(agg.metaRollups))
+	}
+
+	key := metaRollupKey{
+		SrcIP:    "192.168.1.25",
+		DstIP:    "8.8.8.8",
+		SrcPort:  53000,
+		DstPort:  53,
+		Protocol: "udp",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for key %+v", key)
+	}
+	if entry.SNI != "www.google.com" {
+		t.Fatalf("expected qname fallback to populate sni, got %q", entry.SNI)
+	}
+}
+
+func TestTrackMetaWindowRollupPrefersSNIOverQname(t *testing.T) {
+	agg, err := New(&Config{})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	agg.trackMetaWindowRollup(map[string]interface{}{
+		"type":             "connection",
+		"src_ip":           "192.168.1.25",
+		"dst_ip":           "8.8.8.8",
+		"src_port":         float64(53001),
+		"dst_port":         float64(53),
+		"protocol":         "udp",
+		"sni":              "secure.google.com",
+		"qname":            "dns.google.com",
+		"session_start_ns": float64(1773919447000000000),
+		"session_end_ns":   float64(1773919449000000000),
+		"packets_incoming": float64(1),
+		"packets_outgoing": float64(1),
+	})
+
+	agg.metaMu.RLock()
+	defer agg.metaMu.RUnlock()
+	if len(agg.metaRollups) != 1 {
+		t.Fatalf("expected one rollup, got %d", len(agg.metaRollups))
+	}
+
+	key := metaRollupKey{
+		SrcIP:    "192.168.1.25",
+		DstIP:    "8.8.8.8",
+		SrcPort:  53001,
+		DstPort:  53,
+		Protocol: "udp",
+	}
+	entry, ok := agg.metaRollups[key]
+	if !ok {
+		t.Fatalf("expected rollup entry for key %+v", key)
+	}
+	if entry.SNI != "secure.google.com" {
+		t.Fatalf("expected explicit sni to win over qname, got %q", entry.SNI)
 	}
 }
 
