@@ -184,6 +184,20 @@ func (s *PostgreSQLStorage) UpsertMetaWindowRows(ctx context.Context, rows []EBP
 // WHAT: Create PostgreSQLStorage with separate L7 and eBPF storage instances
 // HOW: Set up connection pool, run migrations, and initialize both storage backends
 func NewPostgreSQLStorage(ctx context.Context, connStr string) (*PostgreSQLStorage, error) {
+       // ANCHOR: Run migrations before pool creation to avoid puddle v1.3.0 deadlock on pool.Close()
+       // WHY: pgxpool.ConnectConfig spawns MinConns background goroutines; if migration fails and
+       // pool.Close() is called while those goroutines are still connecting, puddle's WaitGroup
+       // deadlocks. Running migrations via a plain pgx.Connect first avoids the pool entirely.
+       migConn, err := pgx.Connect(ctx, connStr)
+       if err != nil {
+               return nil, fmt.Errorf("failed to connect for migrations: %w", err)
+       }
+       if err := RunMigrations(ctx, migConn); err != nil {
+               migConn.Close(ctx)
+               return nil, fmt.Errorf("failed to run migrations: %w", err)
+       }
+       migConn.Close(ctx)
+
 	// Create connection pool
 	config, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
@@ -208,19 +222,19 @@ func NewPostgreSQLStorage(ctx context.Context, connStr string) (*PostgreSQLStora
 	}
 
 	// Run migrations
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("failed to acquire connection for migrations: %w", err)
-	}
-	defer conn.Release()
+	//conn, err := pool.Acquire(ctx)
+	//if err != nil {
+	//	pool.Close()
+	//	return nil, fmt.Errorf("failed to acquire connection for migrations: %w", err)
+	//}
+	//defer conn.Release()
 
-	if err := RunMigrations(ctx, conn.Conn()); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("failed to run migrations: %w", err)
-	}
+	//if err := RunMigrations(ctx, conn.Conn()); err != nil {
+	//	pool.Close()
+	//	return nil, fmt.Errorf("failed to run migrations: %w", err)
+	//}
 
-	logger.Infof("✅ PostgreSQL storage initialized with connection pool (max_conns=20, min_conns=5)")
+	//logger.Infof("✅ PostgreSQL storage initialized with connection pool (max_conns=20, min_conns=5)")
 
 	return &PostgreSQLStorage{
 		pool:        pool,
